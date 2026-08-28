@@ -1,27 +1,3 @@
-CYBER SNIPER v7.0
-NEON HUNTER // MULTI-SOURCE SOLANA SCANNER
-
-
-Install:
-pip install streamlit requests pandas solders python-dotenv streamlit-autorefresh
-
-
-Optional:
-BIRDEYE_API_KEY=...
-HELIUS_KEY=...
-SOLANA_PRIVATE_KEY=...
-
-
-Run:
-streamlit run app.py --server.headless true
-
-
-IMPORTANT:
-PAPER MODE IS THE DEFAULT.
-LIVE MODE IS HIGH RISK.
-NEVER PUT PRIVATE KEYS OR API KEYS INTO SOURCE CODE.
-Rotate any API key that has previously been exposed.
-
 import os
 import json
 import time
