@@ -1,9 +1,10 @@
 import os
 import json
 import time
-import math
-import random
+import base64
 import threading
+import random
+import traceback
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -14,6 +15,7 @@ import streamlit as st
 
 from dotenv import load_dotenv
 from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -21,16 +23,19 @@ try:
 except ImportError:
     HAS_AUTOREFRESH = False
 
-
-# ================================================================
-# ENVIRONMENT
-# ================================================================
-
 load_dotenv()
+
+# ================================================================
+# CONFIG
+# ================================================================
+
+APP_VERSION = "8.0"
+
+SOL_MINT = "So11111111111111111111111111111111111111112"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 HELIUS_KEY = os.getenv("HELIUS_KEY", "").strip()
 BIRDEYE_KEY = os.getenv("BIRDEYE_API_KEY", "").strip()
-PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "").strip()
 
 HELIUS_RPC_URL = (
     f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
@@ -38,111 +43,35 @@ HELIUS_RPC_URL = (
     else ""
 )
 
-BIRDEYE_URL = "https://public-api.birdeye.so"
-DEXSCREENER_URL = "https://api.dexscreener.com"
+# Jupiter endpoint can be overridden without editing the program.
+JUPITER_API_BASE = os.getenv(
+    "JUPITER_API_BASE",
+    "https://quote-api.jup.ag/v6"
+).rstrip("/")
 
-WSOL_MINT = "So11111111111111111111111111111111111111112"
+DEXSCREENER_API = "https://api.dexscreener.com"
+BIRDEYE_API = "https://public-api.birdeye.so"
+RUGCHECK_API = "https://api.rugcheck.xyz/v1"
 
-STATE_FILE = "cyber_sniper_state.json"
+STATE_FILE = os.getenv(
+    "CYBER_SNIPER_STATE_FILE",
+    "cyber_sniper_state.json"
+)
 
-MAX_TRADE_SOL_CAP = 0.5
+MAX_TRADE_SOL_CAP = 0.50
 
-REQUEST_TIMEOUT = 12
-SCAN_INTERVAL_SECONDS = 20
-
-# Default safety thresholds.
-DEFAULT_CONFIG = {
-    "snipe_amount": 0.05,
-    "take_profit_pct": 50,
-    "trailing_stop_pct": 15,
-    "min_liquidity_usd": 15000,
-    "min_volume_24h": 5000,
-    "min_txns_24h": 50,
-    "max_top10_pct": 40,
-    "max_positions": 5,
-    "daily_loss_limit": 0.2,
-    "min_score": 65,
-    "max_token_age_hours": 168,
-}
-
+REQUEST_TIMEOUT = 15
+SCAN_INTERVAL_SECONDS = 15
 
 # ================================================================
 # HTTP SESSION
 # ================================================================
 
-SESSION = requests.Session()
-
-SESSION.headers.update({
-    "User-Agent": "CyberSniper/7.0",
+HTTP = requests.Session()
+HTTP.headers.update({
+    "User-Agent": "CyberSniper/8.0",
     "Accept": "application/json",
 })
-
-
-def safe_get(
-    url: str,
-    *,
-    params: Optional[Dict] = None,
-    headers: Optional[Dict] = None,
-    timeout: int = REQUEST_TIMEOUT,
-    retries: int = 2,
-) -> Optional[requests.Response]:
-
-    for attempt in range(retries + 1):
-        try:
-            response = SESSION.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=timeout,
-            )
-
-            if response.status_code == 200:
-                return response
-
-            if response.status_code in (429, 500, 502, 503, 504):
-                time.sleep(min(2 ** attempt, 5))
-                continue
-
-            return response
-
-        except requests.RequestException:
-            if attempt < retries:
-                time.sleep(min(2 ** attempt, 5))
-
-    return None
-
-
-def safe_post(
-    url: str,
-    *,
-    json_body: Optional[Dict] = None,
-    timeout: int = REQUEST_TIMEOUT,
-    retries: int = 2,
-) -> Optional[requests.Response]:
-
-    for attempt in range(retries + 1):
-        try:
-            response = SESSION.post(
-                url,
-                json=json_body,
-                timeout=timeout,
-            )
-
-            if response.status_code == 200:
-                return response
-
-            if response.status_code in (429, 500, 502, 503, 504):
-                time.sleep(min(2 ** attempt, 5))
-                continue
-
-            return response
-
-        except requests.RequestException:
-            if attempt < retries:
-                time.sleep(min(2 ** attempt, 5))
-
-    return None
-
 
 # ================================================================
 # STATE
@@ -150,8 +79,10 @@ def safe_post(
 
 @dataclass
 class EngineState:
-
-    lock: threading.RLock = field(default_factory=threading.RLock)
+    # IMPORTANT:
+    # This object is intentionally NOT passed as a normal argument
+    # to a Streamlit cached function. See start_engine(_state).
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
     running: bool = False
     paper_mode: bool = True
@@ -163,134 +94,169 @@ class EngineState:
     trades: List[Dict] = field(default_factory=list)
 
     discovered: List[Dict] = field(default_factory=list)
-    rejected: List[Dict] = field(default_factory=list)
-
-    seen_mints: Dict[str, float] = field(default_factory=dict)
-
     logs: List[str] = field(default_factory=list)
 
-    config: Dict = field(
-        default_factory=lambda: dict(DEFAULT_CONFIG)
-    )
+    last_scan: str = "Never"
+    last_scan_count: int = 0
+    scan_errors: List[str] = field(default_factory=list)
 
-    scanner_stats: Dict = field(
-        default_factory=lambda: {
-            "scans": 0,
-            "raw_candidates": 0,
-            "unique_candidates": 0,
-            "accepted": 0,
-            "rejected": 0,
-            "last_scan": "",
-        }
-    )
+    engine_started_at: str = ""
+
+    config: Dict = field(default_factory=lambda: {
+        "snipe_amount": 0.05,
+        "take_profit_pct": 50.0,
+        "trailing_stop_pct": 15.0,
+
+        "min_liquidity_usd": 15000.0,
+        "min_volume_24h": 5000.0,
+
+        "max_top10_pct": 40.0,
+        "min_lp_locked_pct": 0.0,
+
+        "max_positions": 5,
+        "daily_loss_limit": 0.20,
+
+        "min_token_age_minutes": 0,
+        "max_token_age_hours": 168,
+
+        "min_score": 45,
+
+        "use_dexscreener": True,
+        "use_birdeye_new": True,
+        "use_birdeye_ranked": True,
+        "use_dex_profiles": True,
+        "use_dex_boosts": True,
+
+        "require_rugcheck": False,
+        "require_sell_quote": False,
+    })
 
     def log(self, message: str, tag: str = "sys"):
+        ts = datetime.now().strftime("%H:%M:%S")
 
-        timestamp = datetime.now().strftime("%H:%M:%S")
+        safe = str(message).replace("<", "&lt;").replace(">", "&gt;")
 
         with self.lock:
             self.logs.insert(
                 0,
-                f'<div class="line {tag}">[{timestamp}] {message}</div>'
+                f'<div class="line {tag}">[{ts}] {safe}</div>'
             )
-
             self.logs = self.logs[:120]
 
-        print(f"[{timestamp}] {message}")
+        print(f"[{ts}] {message}")
 
+
+# ================================================================
+# STREAMLIT RESOURCE STATE
+# ================================================================
 
 @st.cache_resource
 def get_state() -> EngineState:
-
     state = EngineState()
-    load_state(state)
-
+    load_persisted(state)
     return state
 
 
-def load_state(state: EngineState):
-
+def load_persisted(state: EngineState):
     if not os.path.exists(STATE_FILE):
         return
 
     try:
-
-        with open(STATE_FILE, "r", encoding="utf-8") as file:
-            data = json.load(file)
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
         with state.lock:
             state.positions = data.get("positions", [])
             state.trades = data.get("trades", [])
-            state.seen_mints = data.get("seen_mints", {})
 
     except Exception as exc:
-        print(f"State load error: {exc}")
+        print(f"state load error: {exc}")
 
 
-def save_state(state: EngineState):
-
+def save_persisted(state: EngineState):
     try:
-
         with state.lock:
-
             data = {
                 "positions": state.positions,
                 "trades": state.trades,
-                "seen_mints": state.seen_mints,
             }
 
-        temp_file = STATE_FILE + ".tmp"
+        tmp_file = STATE_FILE + ".tmp"
 
-        with open(temp_file, "w", encoding="utf-8") as file:
-            json.dump(data, file, indent=2)
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
 
-        os.replace(temp_file, STATE_FILE)
+        os.replace(tmp_file, STATE_FILE)
 
     except Exception as exc:
-        print(f"State save error: {exc}")
+        print(f"state save error: {exc}")
 
 
 # ================================================================
-# WALLET
+# GENERIC HTTP HELPERS
 # ================================================================
 
-def load_wallet_from_env(state: EngineState):
-
-    if not PRIVATE_KEY:
-        return
-
-    if state.wallet is not None:
-        return
-
+def http_get(
+    url: str,
+    *,
+    params: Optional[Dict] = None,
+    headers: Optional[Dict] = None,
+    timeout: int = REQUEST_TIMEOUT,
+):
     try:
-
-        wallet = Keypair.from_base58_string(PRIVATE_KEY)
-
-        with state.lock:
-            state.wallet = wallet
-            state.wallet_address = str(wallet.pubkey())
-
-        state.log(
-            f"Wallet loaded: {state.wallet_address[:6]}..."
-            f"{state.wallet_address[-4:]}",
-            "sys",
+        response = HTTP.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=timeout,
         )
 
-    except Exception as exc:
-        state.log(f"Wallet error: {exc}", "sell-loss")
+        if response.status_code != 200:
+            return None, f"HTTP {response.status_code}: {response.text[:250]}"
+
+        try:
+            return response.json(), None
+        except Exception:
+            return None, "Invalid JSON response"
+
+    except requests.RequestException as exc:
+        return None, str(exc)
+
+
+def http_post(
+    url: str,
+    *,
+    json_data: Optional[Dict] = None,
+    headers: Optional[Dict] = None,
+    timeout: int = REQUEST_TIMEOUT,
+):
+    try:
+        response = HTTP.post(
+            url,
+            json=json_data,
+            headers=headers,
+            timeout=timeout,
+        )
+
+        if response.status_code not in (200, 201):
+            return None, f"HTTP {response.status_code}: {response.text[:300]}"
+
+        try:
+            return response.json(), None
+        except Exception:
+            return None, "Invalid JSON response"
+
+    except requests.RequestException as exc:
+        return None, str(exc)
 
 
 # ================================================================
 # RPC
 # ================================================================
 
-def rpc_call(
-    method: str,
-    params: List,
-) -> Optional[Dict]:
-
+def rpc_call(method: str, params: list):
     if not HELIUS_RPC_URL:
-        return None
+        return None, "HELIUS_KEY not configured"
 
     payload = {
         "jsonrpc": "2.0",
@@ -299,37 +265,43 @@ def rpc_call(
         "params": params,
     }
 
-    response = safe_post(
-        HELIUS_RPC_URL,
-        json_body=payload,
-    )
-
-    if response is None:
-        return None
-
     try:
-        result = response.json()
+        response = HTTP.post(
+            HELIUS_RPC_URL,
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
 
-        if "error" in result:
-            return None
+        if response.status_code != 200:
+            return None, f"RPC HTTP {response.status_code}"
 
-        return result.get("result")
+        data = response.json()
 
-    except Exception:
-        return None
+        if "error" in data:
+            return None, str(data["error"])
+
+        return data.get("result"), None
+
+    except Exception as exc:
+        return None, str(exc)
+
+
+def rpc_health() -> Tuple[bool, str]:
+    result, error = rpc_call("getHealth", [])
+
+    if error:
+        return False, error
+
+    return True, str(result)
 
 
 def get_wallet_balance(pubkey: str) -> float:
-
     if not pubkey:
         return 0.0
 
-    result = rpc_call(
-        "getBalance",
-        [pubkey],
-    )
+    result, error = rpc_call("getBalance", [pubkey])
 
-    if not result:
+    if error or not result:
         return 0.0
 
     try:
@@ -339,133 +311,194 @@ def get_wallet_balance(pubkey: str) -> float:
 
 
 def get_token_balance(
-    owner: str,
-    mint: str,
+    pubkey: str,
+    mint: str
 ) -> Tuple[int, int]:
 
-    result = rpc_call(
+    if not pubkey or not mint:
+        return 0, 0
+
+    result, error = rpc_call(
         "getTokenAccountsByOwner",
         [
-            owner,
+            pubkey,
             {"mint": mint},
             {"encoding": "jsonParsed"},
         ],
     )
 
-    if not result:
+    if error or not result:
         return 0, 0
 
     try:
-
         accounts = result.get("value", [])
 
         if not accounts:
             return 0, 0
 
         amount = (
-            accounts[0]
-            ["account"]
-            ["data"]
-            ["parsed"]
-            ["info"]
-            ["tokenAmount"]
+            accounts[0]["account"]["data"]
+            ["parsed"]["info"]["tokenAmount"]
         )
 
-        return (
-            int(amount["amount"]),
-            int(amount["decimals"]),
-        )
+        return int(amount["amount"]), int(amount["decimals"])
 
     except Exception:
         return 0, 0
+
+
+def send_raw_transaction_rpc(
+    signed_tx_bytes: bytes
+) -> Optional[str]:
+
+    if not HELIUS_RPC_URL:
+        return None
+
+    encoded = base64.b64encode(signed_tx_bytes).decode("utf-8")
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            encoded,
+            {
+                "encoding": "base64",
+                "skipPreflight": False,
+                "preflightCommitment": "processed",
+                "maxRetries": 3,
+            },
+        ],
+    }
+
+    try:
+        response = HTTP.post(
+            HELIUS_RPC_URL,
+            json=payload,
+            timeout=20,
+        )
+
+        if response.status_code != 200:
+            return None
+
+        data = response.json()
+
+        if "error" in data:
+            print(f"sendTransaction error: {data['error']}")
+            return None
+
+        return data.get("result")
+
+    except Exception as exc:
+        print(f"transaction error: {exc}")
+        return None
+
+
+def confirm_transaction_rpc(
+    signature: str,
+    timeout: int = 40
+) -> bool:
+
+    started = time.time()
+
+    while time.time() - started < timeout:
+
+        result, error = rpc_call(
+            "getSignatureStatuses",
+            [
+                [signature],
+                {"searchTransactionHistory": True},
+            ],
+        )
+
+        if not error and result:
+            statuses = result.get("value", [])
+
+            if statuses and statuses[0] is not None:
+                status = statuses[0]
+
+                if status.get("err") is not None:
+                    return False
+
+                if status.get("confirmationStatus") in (
+                    "confirmed",
+                    "finalized",
+                ):
+                    return True
+
+        time.sleep(2)
+
+    return False
 
 
 # ================================================================
 # DEXSCREENER DISCOVERY
 # ================================================================
 
-def dex_token_search(query: str) -> List[Dict]:
+def dex_pairs_for_tokens(mints: List[str]) -> List[Dict]:
+    """
+    DEX Screener permits multiple comma-separated token addresses
+    in this endpoint, up to 30 at a time.
+    """
 
-    response = safe_get(
-        f"{DEXSCREENER_URL}/latest/dex/search",
-        params={"q": query},
-    )
-
-    if not response:
+    if not mints:
         return []
 
-    try:
-        return response.json().get("pairs") or []
-    except Exception:
-        return []
+    out = []
+
+    for start in range(0, len(mints), 30):
+
+        batch = mints[start:start + 30]
+
+        url = (
+            f"{DEXSCREENER_API}/tokens/v1/solana/"
+            + ",".join(batch)
+        )
+
+        data, error = http_get(url)
+
+        if error or not isinstance(data, list):
+            continue
+
+        out.extend(data)
+
+    return out
 
 
-def dex_boosted_tokens() -> List[Dict]:
+def normalize_pair(pair: Dict, source: str) -> Optional[Dict]:
 
-    response = safe_get(
-        f"{DEXSCREENER_URL}/token-boosts/latest/v1"
-    )
-
-    if not response:
-        return []
-
-    try:
-        return response.json() or []
-    except Exception:
-        return []
-
-
-def dex_token_pairs(mint: str) -> List[Dict]:
-
-    response = safe_get(
-        f"{DEXSCREENER_URL}/latest/dex/tokens/{mint}"
-    )
-
-    if not response:
-        return []
-
-    try:
-        return response.json().get("pairs") or []
-    except Exception:
-        return []
-
-
-def normalize_dex_pair(pair: Dict, source: str) -> Optional[Dict]:
+    if pair.get("chainId") != "solana":
+        return None
 
     base = pair.get("baseToken") or {}
-
     mint = base.get("address")
 
     if not mint:
         return None
 
-    liquidity = (
-        pair.get("liquidity") or {}
-    ).get("usd", 0) or 0
+    liquidity = float(
+        (pair.get("liquidity") or {}).get("usd") or 0
+    )
 
-    volume = (
-        pair.get("volume") or {}
-    ).get("h24", 0) or 0
+    volume_24h = float(
+        (pair.get("volume") or {}).get("h24") or 0
+    )
 
-    txns = (
-        pair.get("txns") or {}
-    ).get("h24") or {}
+    txns_24h = pair.get("txns", {}).get("h24", {}) or {}
 
-    buys = txns.get("buys", 0) or 0
-    sells = txns.get("sells", 0) or 0
+    buys = int(txns_24h.get("buys") or 0)
+    sells = int(txns_24h.get("sells") or 0)
 
-    created_ms = pair.get("pairCreatedAt")
+    pair_created = pair.get("pairCreatedAt")
 
-    age_hours = None
+    age_minutes = None
 
-    if created_ms:
-
+    if pair_created:
         try:
-            age_hours = max(
+            age_minutes = max(
                 0,
-                (
-                    time.time() - float(created_ms) / 1000
-                ) / 3600,
+                (time.time() * 1000 - float(pair_created))
+                / 60000
             )
         except Exception:
             pass
@@ -473,886 +506,661 @@ def normalize_dex_pair(pair: Dict, source: str) -> Optional[Dict]:
     return {
         "mint": mint,
         "symbol": base.get("symbol") or "UNKNOWN",
-        "name": base.get("name") or "Unknown",
+        "name": base.get("name") or "",
         "source": source,
-        "dex": pair.get("dexId") or "unknown",
-        "liquidity": float(liquidity),
-        "volume_24h": float(volume),
-        "buys_24h": int(buys),
-        "sells_24h": int(sells),
-        "txns_24h": int(buys + sells),
+
+        "liquidity": liquidity,
+        "volume_24h": volume_24h,
+
+        "buys_24h": buys,
+        "sells_24h": sells,
+
+        "pair_address": pair.get("pairAddress", ""),
+        "dex": pair.get("dexId", ""),
+        "url": pair.get("url", ""),
+
         "price_usd": float(pair.get("priceUsd") or 0),
-        "pair_address": pair.get("pairAddress") or "",
-        "url": pair.get("url") or "",
-        "age_hours": age_hours,
+        "fdv": float(pair.get("fdv") or 0),
+
+        "pair_created_at": pair_created,
+        "age_minutes": age_minutes,
+
+        "boosts": int(
+            (pair.get("boosts") or {}).get("active") or 0
+        ),
+
+        "market_cap": float(
+            pair.get("marketCap") or 0
+        ),
+
+        "raw": pair,
     }
 
 
-def discover_dexscreener() -> List[Dict]:
+def get_dexscreener_tokens(
+    limit: int = 50
+) -> Tuple[List[Dict], List[str]]:
 
     candidates = []
-    seen = set()
+    errors = []
 
     # ------------------------------------------------------------
-    # Boosted tokens
+    # 1. Latest boosts
     # ------------------------------------------------------------
 
-    for item in dex_boosted_tokens():
+    data, error = http_get(
+        f"{DEXSCREENER_API}/token-boosts/latest/v1"
+    )
 
-        if item.get("chainId") != "solana":
-            continue
+    if error:
+        errors.append(f"DS boosts: {error}")
 
-        mint = item.get("tokenAddress")
+    else:
+        mints = [
+            x.get("tokenAddress")
+            for x in (data or [])
+            if x.get("chainId") == "solana"
+            and x.get("tokenAddress")
+        ]
 
-        if not mint or mint in seen:
-            continue
-
-        seen.add(mint)
-
-        pairs = dex_token_pairs(mint)
+        pairs = dex_pairs_for_tokens(mints[:30])
 
         for pair in pairs:
-
-            if pair.get("chainId") != "solana":
-                continue
-
-            normalized = normalize_dex_pair(
-                pair,
-                "DEXSCREENER BOOST",
-            )
-
-            if normalized:
-                candidates.append(normalized)
+            item = normalize_pair(pair, "dex_boost")
+            if item:
+                candidates.append(item)
 
     # ------------------------------------------------------------
-    # Search discovery terms
-    #
-    # DexScreener search is not a guaranteed "new token" feed.
-    # These searches supplement the boost feed.
+    # 2. Latest token profiles
     # ------------------------------------------------------------
 
-    for query in (
-        "SOL",
-        "USD",
-        "USDC",
-    ):
+    data, error = http_get(
+        f"{DEXSCREENER_API}/token-profiles/latest/v1"
+    )
 
-        pairs = dex_token_search(query)
+    if error:
+        errors.append(f"DS profiles: {error}")
+
+    else:
+        mints = [
+            x.get("tokenAddress")
+            for x in (data or [])
+            if x.get("chainId") == "solana"
+            and x.get("tokenAddress")
+        ]
+
+        pairs = dex_pairs_for_tokens(mints[:30])
 
         for pair in pairs:
+            item = normalize_pair(pair, "dex_profile")
+            if item:
+                candidates.append(item)
 
-            if pair.get("chainId") != "solana":
-                continue
+    # ------------------------------------------------------------
+    # 3. Top boosts
+    # ------------------------------------------------------------
 
-            normalized = normalize_dex_pair(
-                pair,
-                "DEXSCREENER SEARCH",
-            )
+    data, error = http_get(
+        f"{DEXSCREENER_API}/token-boosts/top/v1"
+    )
 
-            if normalized:
-                mint = normalized["mint"]
+    if error:
+        errors.append(f"DS top boosts: {error}")
 
-                if mint not in seen:
-                    seen.add(mint)
-                    candidates.append(normalized)
+    else:
+        mints = [
+            x.get("tokenAddress")
+            for x in (data or [])
+            if x.get("chainId") == "solana"
+            and x.get("tokenAddress")
+        ]
 
-    return candidates
+        pairs = dex_pairs_for_tokens(mints[:30])
+
+        for pair in pairs:
+            item = normalize_pair(pair, "dex_top_boost")
+            if item:
+                candidates.append(item)
+
+    return candidates[:limit], errors
 
 
 # ================================================================
 # BIRDEYE DISCOVERY
-#
-# Birdeye currently exposes:
-#   - new listings
-#   - trending tokens
-#   - token lists
-#   - markets
-#
-# We use it only when an API key is configured.
 # ================================================================
 
 def birdeye_headers() -> Dict:
-
     return {
         "X-API-KEY": BIRDEYE_KEY,
         "x-chain": "solana",
-        "accept": "application/json",
     }
 
 
-def birdeye_new_listings() -> List[Dict]:
+def get_birdeye_new_tokens(
+    limit: int = 20
+) -> Tuple[List[Dict], List[str]]:
 
     if not BIRDEYE_KEY:
-        return []
+        return [], ["Birdeye: BIRDEYE_API_KEY not configured"]
 
-    response = safe_get(
-        f"{BIRDEYE_URL}/defi/v2/tokens/new_listing",
+    data, error = http_get(
+        f"{BIRDEYE_API}/defi/v2/tokens/new_listing",
         params={
-            "limit": 20,
+            "limit": min(limit, 20),
             "meme_platform_enabled": "true",
         },
         headers=birdeye_headers(),
     )
 
-    if not response:
-        return []
+    if error:
+        return [], [f"Birdeye new listings: {error}"]
 
-    try:
+    raw_items = []
 
-        data = response.json()
+    if isinstance(data, dict):
+        payload = data.get("data")
 
-        return (
-            data.get("data", {}).get("items")
-            or data.get("data", {}).get("tokens")
-            or []
+        if isinstance(payload, dict):
+            raw_items = (
+                payload.get("items")
+                or payload.get("tokens")
+                or []
+            )
+        elif isinstance(payload, list):
+            raw_items = payload
+
+    out = []
+
+    for token in raw_items:
+
+        mint = (
+            token.get("address")
+            or token.get("tokenAddress")
+            or token.get("address_id")
         )
 
-    except Exception:
-        return []
+        if not mint:
+            continue
+
+        out.append({
+            "mint": mint,
+            "symbol": token.get("symbol") or "UNKNOWN",
+            "name": token.get("name") or "",
+            "source": "birdeye_new",
+            "liquidity": float(
+                token.get("liquidity") or 0
+            ),
+            "volume_24h": float(
+                token.get("volume24hUSD")
+                or token.get("volume24h")
+                or 0
+            ),
+            "buys_24h": int(
+                token.get("buy24h")
+                or token.get("buys24h")
+                or 0
+            ),
+            "sells_24h": int(
+                token.get("sell24h")
+                or token.get("sells24h")
+                or 0
+            ),
+            "pair_address": "",
+            "dex": "",
+            "url": "",
+            "price_usd": float(
+                token.get("price") or 0
+            ),
+            "fdv": float(
+                token.get("fdv") or 0
+            ),
+            "pair_created_at": None,
+            "age_minutes": None,
+            "boosts": 0,
+            "market_cap": float(
+                token.get("marketcap")
+                or token.get("marketCap")
+                or 0
+            ),
+            "raw": token,
+        })
+
+    return out, []
 
 
-def birdeye_trending() -> List[Dict]:
+def get_birdeye_ranked_tokens(
+    limit: int = 50
+) -> Tuple[List[Dict], List[str]]:
 
     if not BIRDEYE_KEY:
-        return []
+        return [], ["Birdeye ranked: BIRDEYE_API_KEY not configured"]
 
-    response = safe_get(
-        f"{BIRDEYE_URL}/defi/token_trending",
+    data, error = http_get(
+        f"{BIRDEYE_API}/defi/v3/token/list",
         params={
-            "sort_by": "volumeUSD",
+            "sort_by": "volume_24h_usd",
             "sort_type": "desc",
-            "offset": 0,
-            "limit": 50,
-            "interval": "1h",
+            "limit": min(limit, 100),
+            "min_liquidity": 1000,
         },
         headers=birdeye_headers(),
     )
 
-    if not response:
-        return []
+    if error:
+        return [], [f"Birdeye ranked: {error}"]
 
-    try:
+    raw_items = []
 
-        data = response.json()
+    if isinstance(data, dict):
+        payload = data.get("data")
 
-        return (
-            data.get("data", {}).get("tokens")
-            or []
+        if isinstance(payload, dict):
+            raw_items = payload.get("items") or []
+        elif isinstance(payload, list):
+            raw_items = payload
+
+    out = []
+
+    for token in raw_items:
+
+        mint = (
+            token.get("address")
+            or token.get("tokenAddress")
         )
 
-    except Exception:
-        return []
+        if not mint:
+            continue
+
+        out.append({
+            "mint": mint,
+            "symbol": token.get("symbol") or "UNKNOWN",
+            "name": token.get("name") or "",
+            "source": "birdeye_ranked",
+
+            "liquidity": float(
+                token.get("liquidity")
+                or token.get("liquidity_usd")
+                or 0
+            ),
+
+            "volume_24h": float(
+                token.get("volume24hUSD")
+                or token.get("volume_24h_usd")
+                or 0
+            ),
+
+            "buys_24h": int(
+                token.get("buy24h")
+                or 0
+            ),
+
+            "sells_24h": int(
+                token.get("sell24h")
+                or 0
+            ),
+
+            "pair_address": "",
+            "dex": "",
+            "url": "",
+
+            "price_usd": float(
+                token.get("price")
+                or 0
+            ),
+
+            "fdv": float(
+                token.get("fdv")
+                or 0
+            ),
+
+            "pair_created_at": None,
+            "age_minutes": None,
+            "boosts": 0,
+
+            "market_cap": float(
+                token.get("marketcap")
+                or token.get("market_cap")
+                or 0
+            ),
+
+            "raw": token,
+        })
+
+    return out, []
 
 
-def birdeye_token_overview(mint: str) -> Optional[Dict]:
+# ================================================================
+# MERGE / ENRICHMENT
+# ================================================================
 
-    if not BIRDEYE_KEY:
-        return None
+def merge_candidates(
+    lists: List[List[Dict]]
+) -> List[Dict]:
 
-    response = safe_get(
-        f"{BIRDEYE_URL}/defi/token_overview",
-        params={
-            "address": mint,
-        },
-        headers=birdeye_headers(),
-    )
+    merged = {}
 
-    if not response:
-        return None
+    for items in lists:
 
-    try:
+        for item in items:
 
-        data = response.json()
+            mint = item.get("mint")
 
-        return data.get("data") or None
+            if not mint:
+                continue
 
-    except Exception:
-        return None
+            if mint not in merged:
+                merged[mint] = dict(item)
 
+                merged[mint]["sources"] = [
+                    item.get("source", "unknown")
+                ]
 
-def normalize_birdeye_token(
-    token: Dict,
-    source: str,
-) -> Optional[Dict]:
+            else:
+                existing = merged[mint]
 
-    mint = (
-        token.get("address")
-        or token.get("tokenAddress")
-    )
+                existing["sources"].append(
+                    item.get("source", "unknown")
+                )
 
-    if not mint:
-        return None
+                existing["liquidity"] = max(
+                    existing.get("liquidity", 0),
+                    item.get("liquidity", 0),
+                )
 
-    return {
-        "mint": mint,
-        "symbol": (
-            token.get("symbol")
-            or token.get("name")
-            or "UNKNOWN"
-        ),
-        "name": token.get("name") or "Unknown",
-        "source": source,
-        "dex": "multiple",
-        "liquidity": float(
-            token.get("liquidity")
-            or token.get("liquidityUsd")
-            or 0
-        ),
-        "volume_24h": float(
-            token.get("volume24hUSD")
-            or token.get("volume24h")
-            or 0
-        ),
-        "buys_24h": int(
-            token.get("buy24h")
-            or token.get("buys24h")
-            or 0
-        ),
-        "sells_24h": int(
-            token.get("sell24h")
-            or token.get("sells24h")
-            or 0
-        ),
-        "txns_24h": int(
-            token.get("trade24h")
-            or token.get("txns24h")
-            or 0
-        ),
-        "price_usd": float(
-            token.get("price")
-            or token.get("priceUsd")
-            or 0
-        ),
-        "pair_address": "",
-        "url": "",
-        "age_hours": None,
-    }
+                existing["volume_24h"] = max(
+                    existing.get("volume_24h", 0),
+                    item.get("volume_24h", 0),
+                )
+
+                existing["buys_24h"] = max(
+                    existing.get("buys_24h", 0),
+                    item.get("buys_24h", 0),
+                )
+
+                existing["sells_24h"] = max(
+                    existing.get("sells_24h", 0),
+                    item.get("sells_24h", 0),
+                )
+
+                existing["boosts"] = max(
+                    existing.get("boosts", 0),
+                    item.get("boosts", 0),
+                )
+
+                if not existing.get("symbol"):
+                    existing["symbol"] = item.get("symbol")
+
+                if not existing.get("name"):
+                    existing["name"] = item.get("name")
+
+                if not existing.get("url"):
+                    existing["url"] = item.get("url")
+
+    return list(merged.values())
 
 
-def discover_birdeye() -> List[Dict]:
+def enrich_with_dex(
+    candidates: List[Dict]
+) -> List[Dict]:
 
-    if not BIRDEYE_KEY:
-        return []
+    mints = [x["mint"] for x in candidates[:100]]
 
-    candidates = []
+    pairs = dex_pairs_for_tokens(mints)
 
-    for token in birdeye_new_listings():
+    best = {}
 
-        normalized = normalize_birdeye_token(
-            token,
-            "BIRDEYE NEW",
+    for pair in pairs:
+
+        item = normalize_pair(pair, "dex_enrichment")
+
+        if not item:
+            continue
+
+        mint = item["mint"]
+
+        old = best.get(mint)
+
+        if old is None:
+            best[mint] = item
+        else:
+            if item["liquidity"] > old["liquidity"]:
+                best[mint] = item
+
+    for candidate in candidates:
+
+        dex = best.get(candidate["mint"])
+
+        if not dex:
+            continue
+
+        candidate["liquidity"] = max(
+            candidate.get("liquidity", 0),
+            dex.get("liquidity", 0),
         )
 
-        if normalized:
-            candidates.append(normalized)
-
-    for token in birdeye_trending():
-
-        normalized = normalize_birdeye_token(
-            token,
-            "BIRDEYE TRENDING",
+        candidate["volume_24h"] = max(
+            candidate.get("volume_24h", 0),
+            dex.get("volume_24h", 0),
         )
 
-        if normalized:
-            candidates.append(normalized)
+        candidate["buys_24h"] = max(
+            candidate.get("buys_24h", 0),
+            dex.get("buys_24h", 0),
+        )
+
+        candidate["sells_24h"] = max(
+            candidate.get("sells_24h", 0),
+            dex.get("sells_24h", 0),
+        )
+
+        candidate["age_minutes"] = dex.get(
+            "age_minutes"
+        )
+
+        candidate["pair_address"] = dex.get(
+            "pair_address"
+        )
+
+        candidate["dex"] = dex.get("dex")
+        candidate["url"] = dex.get("url")
+
+        candidate["price_usd"] = dex.get(
+            "price_usd",
+            candidate.get("price_usd", 0)
+        )
+
+        candidate["boosts"] = max(
+            candidate.get("boosts", 0),
+            dex.get("boosts", 0),
+        )
 
     return candidates
 
 
 # ================================================================
-# CANDIDATE MERGING
+# TOKEN SCORING
 # ================================================================
 
-def merge_candidates(
-    candidates: List[Dict],
-) -> List[Dict]:
-
-    merged = {}
-
-    for candidate in candidates:
-
-        mint = candidate.get("mint")
-
-        if not mint:
-            continue
-
-        if mint not in merged:
-
-            merged[mint] = dict(candidate)
-
-            merged[mint]["sources"] = [
-                candidate.get("source", "unknown")
-            ]
-
-        else:
-
-            current = merged[mint]
-
-            current["liquidity"] = max(
-                current.get("liquidity", 0),
-                candidate.get("liquidity", 0),
-            )
-
-            current["volume_24h"] = max(
-                current.get("volume_24h", 0),
-                candidate.get("volume_24h", 0),
-            )
-
-            current["buys_24h"] = max(
-                current.get("buys_24h", 0),
-                candidate.get("buys_24h", 0),
-            )
-
-            current["sells_24h"] = max(
-                current.get("sells_24h", 0),
-                candidate.get("sells_24h", 0),
-            )
-
-            source = candidate.get("source", "unknown")
-
-            if source not in current["sources"]:
-                current["sources"].append(source)
-
-    return list(merged.values())
-
-
-# ================================================================
-# TOKEN ENRICHMENT
-# ================================================================
-
-def enrich_candidate(token: Dict) -> Dict:
-
-    mint = token["mint"]
-
-    pairs = dex_token_pairs(mint)
-
-    if pairs:
-
-        sol_pairs = [
-            p for p in pairs
-            if p.get("chainId") == "solana"
-        ]
-
-        if sol_pairs:
-
-            # Choose the strongest liquidity market.
-            sol_pairs.sort(
-                key=lambda p: float(
-                    (p.get("liquidity") or {}).get("usd", 0)
-                    or 0
-                ),
-                reverse=True,
-            )
-
-            best = normalize_dex_pair(
-                sol_pairs[0],
-                "DEXSCREENER ENRICHMENT",
-            )
-
-            if best:
-
-                token["liquidity"] = max(
-                    token.get("liquidity", 0),
-                    best.get("liquidity", 0),
-                )
-
-                token["volume_24h"] = max(
-                    token.get("volume_24h", 0),
-                    best.get("volume_24h", 0),
-                )
-
-                token["buys_24h"] = max(
-                    token.get("buys_24h", 0),
-                    best.get("buys_24h", 0),
-                )
-
-                token["sells_24h"] = max(
-                    token.get("sells_24h", 0),
-                    best.get("sells_24h", 0),
-                )
-
-                token["txns_24h"] = max(
-                    token.get("txns_24h", 0),
-                    best.get("txns_24h", 0),
-                )
-
-                token["price_usd"] = best.get(
-                    "price_usd",
-                    token.get("price_usd", 0),
-                )
-
-                token["pair_address"] = best.get(
-                    "pair_address",
-                    "",
-                )
-
-                token["url"] = best.get(
-                    "url",
-                    "",
-                )
-
-                if best.get("age_hours") is not None:
-                    token["age_hours"] = best["age_hours"]
-
-                token["dex"] = best.get(
-                    "dex",
-                    token.get("dex", "unknown"),
-                )
-
-    return token
-
-
-# ================================================================
-# SCORING
-# ================================================================
-
-def clamp(value: float, low: float, high: float) -> float:
-
-    return max(low, min(high, value))
-
-
-def liquidity_score(liquidity: float) -> float:
-
-    if liquidity <= 0:
-        return 0
-
-    # Logarithmic scaling prevents enormous liquidity
-    # from completely dominating the score.
-    score = (
-        math.log10(max(liquidity, 1))
-        / math.log10(1_000_000)
-        * 100
-    )
-
-    return clamp(score, 0, 100)
-
-
-def volume_score(volume: float) -> float:
-
-    if volume <= 0:
-        return 0
-
-    score = (
-        math.log10(max(volume, 1))
-        / math.log10(5_000_000)
-        * 100
-    )
-
-    return clamp(score, 0, 100)
-
-
-def activity_score(
-    buys: int,
-    sells: int,
-) -> float:
-
-    total = buys + sells
-
-    if total <= 0:
-        return 0
-
-    # Balanced activity is preferable to an almost entirely
-    # one-sided flow.
-    balance = min(buys, sells) / max(buys, sells)
-
-    count_score = clamp(
-        math.log10(total + 1) / math.log10(10000) * 100,
-        0,
-        100,
-    )
-
-    return (
-        count_score * 0.65
-        + balance * 100 * 0.35
-    )
-
-
-def source_score(sources: List[str]) -> float:
-
-    score = 20
-
-    for source in sources:
-
-        if "BIRDEYE NEW" in source:
-            score += 25
-
-        elif "BIRDEYE TRENDING" in source:
-            score += 20
-
-        elif "DEXSCREENER BOOST" in source:
-            score += 15
-
-        elif "DEXSCREENER SEARCH" in source:
-            score += 5
-
-    return clamp(score, 0, 100)
-
-
-def age_score(age_hours: Optional[float]) -> float:
-
-    if age_hours is None:
-        return 35
-
-    if age_hours < 0.25:
-        return 35
-
-    if age_hours < 1:
-        return 55
-
-    if age_hours < 6:
-        return 85
-
-    if age_hours < 24:
-        return 100
-
-    if age_hours < 72:
-        return 90
-
-    if age_hours < 168:
-        return 70
-
-    return 35
-
-
-def calculate_score(token: Dict) -> Tuple[int, Dict]:
-
-    liquidity = token.get("liquidity", 0)
-    volume = token.get("volume_24h", 0)
-    buys = token.get("buys_24h", 0)
-    sells = token.get("sells_24h", 0)
-
-    scores = {
-        "liquidity": liquidity_score(liquidity),
-        "volume": volume_score(volume),
-        "activity": activity_score(buys, sells),
-        "sources": source_score(
-            token.get("sources", [])
-        ),
-        "age": age_score(
-            token.get("age_hours")
-        ),
-    }
-
-    final_score = (
-        scores["liquidity"] * 0.28
-        + scores["volume"] * 0.24
-        + scores["activity"] * 0.23
-        + scores["sources"] * 0.10
-        + scores["age"] * 0.15
-    )
-
-    return int(round(clamp(final_score, 0, 100))), scores
-
-
-# ================================================================
-# SAFETY / RISK
-# ================================================================
-
-def check_mint_authorities(mint: str) -> Dict:
-
-    # getAccountInfo is used here rather than pretending a quote
-    # is a security guarantee.
-    result = rpc_call(
-        "getAccountInfo",
-        [
-            mint,
-            {
-                "encoding": "jsonParsed",
-            },
-        ],
-    )
-
-    if not result:
-        return {
-            "available": False,
-            "mint_authority": None,
-            "freeze_authority": None,
-        }
-
-    try:
-
-        parsed = (
-            result["value"]
-            ["data"]
-            ["parsed"]
-            ["info"]
-        )
-
-        return {
-            "available": True,
-            "mint_authority": parsed.get(
-                "mintAuthority"
-            ),
-            "freeze_authority": parsed.get(
-                "freezeAuthority"
-            ),
-        }
-
-    except Exception:
-
-        return {
-            "available": False,
-            "mint_authority": None,
-            "freeze_authority": None,
-        }
-
-
-def estimate_risk(
+def score_token(
     token: Dict,
+    cfg: Dict
 ) -> Tuple[int, List[str]]:
 
-    risk = 0
+    score = 0
     reasons = []
 
-    liquidity = token.get("liquidity", 0)
-    volume = token.get("volume_24h", 0)
-    buys = token.get("buys_24h", 0)
-    sells = token.get("sells_24h", 0)
-
-    if liquidity < 5000:
-        risk += 35
-        reasons.append("very low liquidity")
-
-    elif liquidity < 15000:
-        risk += 15
-        reasons.append("low liquidity")
-
-    if volume < 1000:
-        risk += 25
-        reasons.append("very low volume")
-
-    elif volume < 5000:
-        risk += 10
-        reasons.append("low volume")
-
-    if buys + sells < 20:
-        risk += 20
-        reasons.append("low transaction activity")
-
-    if buys > 0 and sells == 0:
-        risk += 30
-        reasons.append("no observed sells")
-
-    if sells > buys * 5 and sells > 100:
-        risk += 15
-        reasons.append("strong sell imbalance")
-
-    if token.get("age_hours") is not None:
-
-        if token["age_hours"] < 0.10:
-            risk += 15
-            reasons.append("extremely new token")
-
-    return min(risk, 100), reasons
-
-
-def safety_filter(
-    token: Dict,
-    config: Dict,
-) -> Tuple[bool, str]:
-
-    liquidity = token.get("liquidity", 0)
-    volume = token.get("volume_24h", 0)
-    txns = token.get("txns_24h", 0)
-
-    if liquidity < config["min_liquidity_usd"]:
-        return (
-            False,
-            f"liquidity ${liquidity:,.0f} "
-            f"< ${config['min_liquidity_usd']:,.0f}",
-        )
-
-    if volume < config["min_volume_24h"]:
-        return (
-            False,
-            f"volume ${volume:,.0f} "
-            f"< ${config['min_volume_24h']:,.0f}",
-        )
-
-    if txns < config["min_txns_24h"]:
-        return (
-            False,
-            f"transactions {txns} "
-            f"< {config['min_txns_24h']}",
-        )
-
-    age = token.get("age_hours")
-
-    if (
-        age is not None
-        and age > config["max_token_age_hours"]
-    ):
-        return (
-            False,
-            f"token age {age:.1f}h exceeds "
-            f"{config['max_token_age_hours']}h",
-        )
-
-    score, _ = calculate_score(token)
-
-    if score < config["min_score"]:
-        return (
-            False,
-            f"score {score} < {config['min_score']}",
-        )
-
-    return True, "passed"
-
-
-# ================================================================
-# DISCOVERY ENGINE
-# ================================================================
-
-def discover_all(state: EngineState) -> List[Dict]:
-
-    state.log(
-        "SCANNER // collecting discovery feeds...",
-        "sys",
+    liquidity = float(
+        token.get("liquidity", 0) or 0
     )
 
-    all_candidates = []
-
-    dex_candidates = discover_dexscreener()
-
-    state.log(
-        f"DEXSCREENER // {len(dex_candidates)} raw candidates",
-        "sys",
+    volume = float(
+        token.get("volume_24h", 0) or 0
     )
 
-    all_candidates.extend(dex_candidates)
-
-    if BIRDEYE_KEY:
-
-        birdeye_candidates = discover_birdeye()
-
-        state.log(
-            f"BIRDEYE // {len(birdeye_candidates)} raw candidates",
-            "sys",
-        )
-
-        all_candidates.extend(birdeye_candidates)
-
-    else:
-
-        state.log(
-            "BIRDEYE // API key not configured",
-            "sys",
-        )
-
-    merged = merge_candidates(all_candidates)
-
-    state.log(
-        f"MERGER // {len(merged)} unique token mints",
-        "sys",
+    buys = int(
+        token.get("buys_24h", 0) or 0
     )
 
-    enriched = []
-
-    # Prevent an expensive enrichment storm.
-    # Start with the most promising raw candidates.
-    merged.sort(
-        key=lambda x: (
-            x.get("liquidity", 0),
-            x.get("volume_24h", 0),
-        ),
-        reverse=True,
+    sells = int(
+        token.get("sells_24h", 0) or 0
     )
 
-    for token in merged[:80]:
+    boosts = int(
+        token.get("boosts", 0) or 0
+    )
 
-        try:
-            enriched.append(
-                enrich_candidate(token)
-            )
-        except Exception as exc:
-            state.log(
-                f"enrichment error {token.get('symbol')}: {exc}",
-                "sell-loss",
-            )
+    age = token.get("age_minutes")
 
-    return enriched
+    # ------------------------------------------------------------
+    # Liquidity
+    # ------------------------------------------------------------
+
+    if liquidity >= cfg["min_liquidity_usd"]:
+        score += 25
+        reasons.append("liquidity OK")
+
+    elif liquidity >= cfg["min_liquidity_usd"] * 0.5:
+        score += 10
+        reasons.append("medium liquidity")
+
+    # ------------------------------------------------------------
+    # Volume
+    # ------------------------------------------------------------
+
+    if volume >= cfg["min_volume_24h"]:
+        score += 20
+        reasons.append("volume OK")
+
+    elif volume >= cfg["min_volume_24h"] * 0.5:
+        score += 8
+        reasons.append("medium volume")
+
+    # ------------------------------------------------------------
+    # Buy pressure
+    # ------------------------------------------------------------
+
+    total_tx = buys + sells
+
+    if total_tx > 0:
+
+        buy_ratio = buys / total_tx
+
+        if buy_ratio >= 0.65:
+            score += 15
+            reasons.append("buy pressure")
+
+        elif buy_ratio >= 0.52:
+            score += 7
+            reasons.append("slight buy pressure")
+
+    # ------------------------------------------------------------
+    # Multi-source confirmation
+    # ------------------------------------------------------------
+
+    sources = set(token.get("sources", []))
+
+    if len(sources) >= 2:
+        score += 15
+        reasons.append("multi-source")
+
+    # ------------------------------------------------------------
+    # DEX presence
+    # ------------------------------------------------------------
+
+    if token.get("pair_address"):
+        score += 10
+        reasons.append("active pair")
+
+    # ------------------------------------------------------------
+    # Boost signal
+    # ------------------------------------------------------------
+
+    if boosts > 0:
+        score += min(10, boosts)
+        reasons.append("boost activity")
+
+    # ------------------------------------------------------------
+    # Age
+    # ------------------------------------------------------------
+
+    if age is not None:
+
+        if age >= cfg["min_token_age_minutes"]:
+            score += 5
+            reasons.append("age acceptable")
+
+        if age > cfg["max_token_age_hours"] * 60:
+            score -= 15
+            reasons.append("older token")
+
+    return max(0, min(100, score)), reasons
 
 
-def process_candidates(
-    state: EngineState,
+def apply_filters(
     candidates: List[Dict],
-):
+    cfg: Dict
+) -> Tuple[List[Dict], List[Dict]]:
 
     accepted = []
     rejected = []
 
-    with state.lock:
-        config = dict(state.config)
-
     for token in candidates:
 
-        mint = token.get("mint")
-
-        if not mint:
-            continue
-
-        score, component_scores = calculate_score(token)
-
-        token["score"] = score
-        token["score_components"] = component_scores
-
-        risk, risk_reasons = estimate_risk(token)
-
-        token["risk"] = risk
-        token["risk_reasons"] = risk_reasons
-
-        # Never automatically buy a token solely because it
-        # appears on a discovery feed.
-        ok, reason = safety_filter(
-            token,
-            config,
+        liquidity = float(
+            token.get("liquidity", 0) or 0
         )
 
-        if not ok:
+        volume = float(
+            token.get("volume_24h", 0) or 0
+        )
 
-            token["status"] = "REJECTED"
-            token["reject_reason"] = reason
+        age = token.get("age_minutes")
 
-            rejected.append(token)
+        reasons = []
 
-            continue
-
-        # RPC authority check is supplementary.
-        # Missing RPC data does not silently become "safe".
-        authority = check_mint_authorities(mint)
-
-        token["authority_check"] = authority
-
-        if authority["available"]:
-
-            if authority.get("mint_authority"):
-                token["risk"] += 15
-                token["risk_reasons"].append(
-                    "mint authority active"
-                )
-
-            if authority.get("freeze_authority"):
-                token["risk"] += 20
-                token["risk_reasons"].append(
-                    "freeze authority active"
-                )
-
-        if token["risk"] >= 60:
-
-            token["status"] = "HIGH RISK"
-            token["reject_reason"] = (
-                "; ".join(token["risk_reasons"])
-                or "risk score too high"
+        if liquidity < cfg["min_liquidity_usd"]:
+            reasons.append(
+                f"liq ${liquidity:,.0f} < "
+                f"${cfg['min_liquidity_usd']:,.0f}"
             )
 
+        if volume < cfg["min_volume_24h"]:
+            reasons.append(
+                f"vol ${volume:,.0f} < "
+                f"${cfg['min_volume_24h']:,.0f}"
+            )
+
+        if age is not None:
+
+            if age < cfg["min_token_age_minutes"]:
+                reasons.append(
+                    f"too new ({age:.0f}m)"
+                )
+
+            if age > cfg["max_token_age_hours"] * 60:
+                reasons.append(
+                    f"too old ({age / 60:.1f}h)"
+                )
+
+        score, score_reasons = score_token(
+            token,
+            cfg
+        )
+
+        token["score"] = score
+        token["score_reasons"] = score_reasons
+
+        if score < cfg["min_score"]:
+            reasons.append(
+                f"score {score} < {cfg['min_score']}"
+            )
+
+        if reasons:
+            token["reject_reason"] = " | ".join(reasons)
             rejected.append(token)
-
-            continue
-
-        token["status"] = "WATCH"
-        token["reject_reason"] = ""
-
-        accepted.append(token)
+        else:
+            token["reject_reason"] = ""
+            accepted.append(token)
 
     accepted.sort(
         key=lambda x: (
@@ -1368,124 +1176,323 @@ def process_candidates(
         reverse=True,
     )
 
-    with state.lock:
-
-        state.discovered = accepted[:50]
-        state.rejected = rejected[:50]
-
-        state.scanner_stats["scans"] += 1
-        state.scanner_stats["raw_candidates"] = len(candidates)
-        state.scanner_stats["unique_candidates"] = len(candidates)
-        state.scanner_stats["accepted"] = len(accepted)
-        state.scanner_stats["rejected"] = len(rejected)
-        state.scanner_stats["last_scan"] = (
-            datetime.now().strftime("%H:%M:%S")
-        )
-
-    state.log(
-        f"SCAN COMPLETE // {len(accepted)} watch candidates // "
-        f"{len(rejected)} rejected",
-        "buy" if accepted else "sys",
-    )
+    return accepted, rejected
 
 
 # ================================================================
-# PAPER POSITION PRICING
+# RUGCHECK
 # ================================================================
 
-def simulated_price_move(
-    position: Dict,
-) -> float:
-
-    current = float(
-        position.get(
-            "sim_price_usd",
-            position.get("entry_price_usd", 0),
-        )
-    )
-
-    if current <= 0:
-        return 0
-
-    # Small random market movement.
-    # This is deliberately only a visual simulation.
-    drift = random.gauss(0, 0.035)
-
-    current *= max(
-        0.2,
-        1 + drift,
-    )
-
-    position["sim_price_usd"] = current
-
-    entry = float(
-        position.get("entry_price_usd", current)
-    )
-
-    if entry <= 0:
-        return 0
-
-    return (
-        (current - entry)
-        / entry
-        * 100
-    )
-
-
-# ================================================================
-# PAPER BUY
-# ================================================================
-
-def paper_buy(
-    state: EngineState,
-    token: Dict,
+def get_rugcheck_report(
+    mint: str
 ) -> Optional[Dict]:
 
-    amount = float(
-        state.config["snipe_amount"]
+    data, error = http_get(
+        f"{RUGCHECK_API}/tokens/{mint}/report",
+        timeout=10,
     )
 
-    price = float(
-        token.get("price_usd", 0)
+    if error:
+        return None
+
+    return data
+
+
+def safety_check(
+    mint: str,
+    token: Dict,
+    cfg: Dict
+) -> Tuple[bool, str]:
+
+    liquidity = float(
+        token.get("liquidity", 0) or 0
     )
 
-    position = {
-        "mint": token["mint"],
-        "symbol": token.get("symbol", "UNKNOWN"),
-        "entry_sol": amount,
-        "entry_price_usd": price,
-        "sim_price_usd": price,
-        "out_amount": 0,
+    if liquidity < cfg["min_liquidity_usd"]:
+        return False, "liquidity below minimum"
+
+    # RugCheck is optional because APIs can rate-limit or fail.
+    if not cfg["require_rugcheck"]:
+        return True, "basic filters passed"
+
+    report = get_rugcheck_report(mint)
+
+    if not report:
+        return False, "RugCheck unavailable"
+
+    mint_authority = report.get("mintAuthority")
+
+    freeze_authority = report.get("freezeAuthority")
+
+    if mint_authority not in (None, ""):
+        return False, "mint authority active"
+
+    if freeze_authority not in (None, ""):
+        return False, "freeze authority active"
+
+    top_holders = report.get("topHolders") or []
+
+    top10_pct = sum(
+        float(holder.get("pct", 0) or 0)
+        for holder in top_holders[:10]
+    )
+
+    if top10_pct > cfg["max_top10_pct"]:
+        return False, (
+            f"top10 holders {top10_pct:.1f}%"
+        )
+
+    return True, "RugCheck passed"
+
+
+# ================================================================
+# JUPITER
+# ================================================================
+
+def jupiter_quote(
+    input_mint: str,
+    output_mint: str,
+    amount: int,
+    slippage_bps: int = 500,
+) -> Optional[Dict]:
+
+    try:
+
+        response = HTTP.get(
+            f"{JUPITER_API_BASE}/quote",
+            params={
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": amount,
+                "slippageBps": slippage_bps,
+            },
+            timeout=15,
+        )
+
+        if response.status_code != 200:
+            print(
+                f"Jupiter quote HTTP "
+                f"{response.status_code}: "
+                f"{response.text[:250]}"
+            )
+            return None
+
+        return response.json()
+
+    except Exception as exc:
+        print(f"Jupiter quote error: {exc}")
+        return None
+
+
+def simulate_sell_check(
+    mint: str,
+    test_amount: int = 1000
+) -> bool:
+
+    quote = jupiter_quote(
+        mint,
+        SOL_MINT,
+        test_amount,
+        slippage_bps=1000,
+    )
+
+    if not quote:
+        return False
+
+    try:
+        return int(
+            quote.get("outAmount", 0)
+        ) > 0
+    except Exception:
+        return False
+
+
+def jupiter_swap(
+    quote: Dict,
+    wallet: Keypair
+) -> Optional[str]:
+
+    try:
+
+        payload = {
+            "quoteResponse": quote,
+            "userPublicKey": str(wallet.pubkey()),
+            "wrapAndUnwrapSol": True,
+            "dynamicComputeUnitLimit": True,
+            "prioritizationFeeLamports": "auto",
+        }
+
+        response = HTTP.post(
+            f"{JUPITER_API_BASE}/swap",
+            json=payload,
+            timeout=25,
+        )
+
+        if response.status_code != 200:
+            print(
+                "Jupiter swap build failed:",
+                response.text[:500]
+            )
+            return None
+
+        body = response.json()
+
+        raw = base64.b64decode(
+            body["swapTransaction"]
+        )
+
+        unsigned = VersionedTransaction.from_bytes(raw)
+
+        signed = VersionedTransaction(
+            unsigned.message,
+            [wallet],
+        )
+
+        signature = send_raw_transaction_rpc(
+            bytes(signed)
+        )
+
+        if not signature:
+            return None
+
+        if not confirm_transaction_rpc(signature):
+            print(
+                f"Transaction not confirmed: {signature}"
+            )
+            return None
+
+        return signature
+
+    except Exception as exc:
+        print(f"Jupiter swap error: {exc}")
+        return None
+
+
+# ================================================================
+# BUY / SELL
+# ================================================================
+
+def do_buy(
+    state: EngineState,
+    token: Dict,
+    sol_amount: float
+) -> Optional[Dict]:
+
+    mint = token["mint"]
+    symbol = token.get("symbol", "UNKNOWN")
+
+    lamports = int(
+        sol_amount * 1_000_000_000
+    )
+
+    quote = jupiter_quote(
+        SOL_MINT,
+        mint,
+        lamports,
+    )
+
+    if not quote:
+        return None
+
+    out_amount = int(
+        quote.get("outAmount", 0)
+    )
+
+    if out_amount <= 0:
+        return None
+
+    if state.paper_mode:
+
+        signature = "PAPER"
+
+    else:
+
+        if state.wallet is None:
+            return None
+
+        signature = jupiter_swap(
+            quote,
+            state.wallet
+        )
+
+        if not signature:
+            return None
+
+    return {
+        "mint": mint,
+        "symbol": symbol,
+        "entry_sol": sol_amount,
+        "out_amount": out_amount,
         "opened_at": datetime.now().isoformat(),
-        "buy_sig": "PAPER",
+        "buy_sig": signature,
         "peak_pnl_pct": 0.0,
+        "source": token.get("sources", []),
         "score": token.get("score", 0),
     }
 
-    return position
 
+def do_sell(
+    state: EngineState,
+    position: Dict
+) -> Optional[Dict]:
 
-# ================================================================
-# PAPER SELL
-# ================================================================
+    if state.paper_mode:
 
-def paper_sell(
-    position: Dict,
-) -> Dict:
+        pnl_pct = random.uniform(-30, 60)
 
-    entry = float(
-        position.get("entry_sol", 0)
-    )
+        profit = (
+            position["entry_sol"]
+            * pnl_pct
+            / 100
+        )
 
-    pnl_pct = float(
-        position.get("peak_pnl_pct", 0)
-    )
+        exit_sol = (
+            position["entry_sol"]
+            + profit
+        )
 
-    profit = (
-        entry * pnl_pct / 100
-    )
+        signature = "PAPER"
 
-    exit_sol = entry + profit
+    else:
+
+        if state.wallet is None:
+            return None
+
+        balance, _ = get_token_balance(
+            state.wallet_address,
+            position["mint"],
+        )
+
+        if balance <= 0:
+            return None
+
+        quote = jupiter_quote(
+            position["mint"],
+            SOL_MINT,
+            balance,
+            slippage_bps=1000,
+        )
+
+        if not quote:
+            return None
+
+        signature = jupiter_swap(
+            quote,
+            state.wallet
+        )
+
+        if not signature:
+            return None
+
+        exit_sol = (
+            int(quote.get("outAmount", 0))
+            / 1_000_000_000
+        )
+
+        profit = (
+            exit_sol
+            - position["entry_sol"]
+        )
 
     return {
         "date": datetime.now().strftime(
@@ -1496,187 +1503,72 @@ def paper_sell(
         ),
         "symbol": position["symbol"],
         "mint": position["mint"],
-        "entry_sol": entry,
+        "entry_sol": position["entry_sol"],
         "exit_sol": exit_sol,
         "profit": profit,
-        "sell_sig": "PAPER",
+        "sell_sig": signature,
     }
 
 
-# ================================================================
-# POSITION MANAGEMENT
-# ================================================================
-
-def manage_positions(
+def get_current_pnl_pct(
     state: EngineState,
-):
+    position: Dict
+) -> Optional[float]:
 
-    with state.lock:
-        positions = list(state.positions)
-        config = dict(state.config)
+    if state.paper_mode:
+        return None
 
-    for position in positions:
+    amount = int(
+        position.get("out_amount", 0)
+    )
 
-        if state.paper_mode:
+    if amount <= 0:
+        return None
 
-            pnl = simulated_price_move(
-                position
-            )
+    quote = jupiter_quote(
+        position["mint"],
+        SOL_MINT,
+        amount,
+        slippage_bps=1000,
+    )
 
-        else:
-            # Live execution is intentionally not performed by
-            # this discovery build. Keep the engine paper-first
-            # while validating the scanner.
-            continue
+    if not quote:
+        return None
 
-        with state.lock:
-
-            position["peak_pnl_pct"] = max(
-                float(
-                    position.get(
-                        "peak_pnl_pct",
-                        0,
-                    )
-                ),
-                pnl,
-            )
-
-            peak = position["peak_pnl_pct"]
-
-        trailing_trigger = (
-            peak
-            - config["trailing_stop_pct"]
+    try:
+        current_sol = (
+            int(quote.get("outAmount", 0))
+            / 1_000_000_000
         )
 
-        should_close = False
-        reason = ""
-
-        if pnl >= config["take_profit_pct"]:
-
-            should_close = True
-            reason = "take profit"
-
-        elif (
-            peak > 0
-            and pnl <= trailing_trigger
-        ):
-
-            should_close = True
-            reason = "trailing stop"
-
-        elif (
-            peak <= 0
-            and pnl <= -config["trailing_stop_pct"]
-        ):
-
-            should_close = True
-            reason = "stop loss"
-
-        if should_close:
-
-            trade = paper_sell(position)
-
-            with state.lock:
-
-                if position in state.positions:
-                    state.positions.remove(position)
-
-                state.trades.append(trade)
-
-            tag = (
-                "sell-win"
-                if trade["profit"] >= 0
-                else "sell-loss"
-            )
-
-            state.log(
-                f"CLOSED {position['symbol']} "
-                f"({reason}) "
-                f"{trade['profit']:+.4f} SOL",
-                tag,
-            )
-
-            save_state(state)
-
-
-# ================================================================
-# AUTO ENTRY
-# ================================================================
-
-def automatic_entries(
-    state: EngineState,
-):
-
-    if not state.paper_mode:
-        return
-
-    with state.lock:
-
-        if len(state.positions) >= state.config["max_positions"]:
-            return
-
-        candidates = list(state.discovered)
-        config = dict(state.config)
-
-        held = {
-            p["mint"]
-            for p in state.positions
-        }
-
-    # Only consider the highest-scoring candidates.
-    for token in candidates[:10]:
-
-        mint = token["mint"]
-
-        if mint in held:
-            continue
-
-        if token.get("score", 0) < config["min_score"]:
-            continue
-
-        if token.get("risk", 100) >= 60:
-            continue
-
-        position = paper_buy(
-            state,
-            token,
+        entry = float(
+            position.get("entry_sol", 0)
         )
 
-        if not position:
-            continue
+        if entry <= 0:
+            return None
 
-        with state.lock:
-
-            if len(state.positions) >= config["max_positions"]:
-                break
-
-            state.positions.append(position)
-
-        state.log(
-            f"🟢 PAPER ENTRY // "
-            f"{token.get('symbol', 'UNKNOWN')} "
-            f"// SCORE {token.get('score', 0)} "
-            f"// RISK {token.get('risk', 0)}",
-            "buy",
+        return (
+            (current_sol - entry)
+            / entry
+            * 100
         )
 
-        save_state(state)
+    except Exception:
+        return None
 
 
 # ================================================================
-# DAILY PNL
+# PNL
 # ================================================================
 
-def daily_pnl(
-    state: EngineState,
-) -> float:
+def daily_pnl(state: EngineState) -> float:
 
     today = datetime.now().strftime(
         "%Y-%m-%d"
     )
 
     with state.lock:
-
         return sum(
             float(t.get("profit", 0))
             for t in state.trades
@@ -1685,44 +1577,124 @@ def daily_pnl(
 
 
 # ================================================================
+# DISCOVERY ENGINE
+# ================================================================
+
+def discover_tokens(
+    state: EngineState
+) -> List[Dict]:
+
+    cfg = dict(state.config)
+
+    all_lists = []
+    errors = []
+
+    if cfg["use_dexscreener"]:
+
+        items, errs = get_dexscreener_tokens()
+
+        all_lists.append(items)
+        errors.extend(errs)
+
+    if cfg["use_birdeye_new"]:
+
+        items, errs = get_birdeye_new_tokens()
+
+        all_lists.append(items)
+        errors.extend(errs)
+
+    if cfg["use_birdeye_ranked"]:
+
+        items, errs = get_birdeye_ranked_tokens()
+
+        all_lists.append(items)
+        errors.extend(errs)
+
+    candidates = merge_candidates(
+        all_lists
+    )
+
+    if candidates:
+
+        candidates = enrich_with_dex(
+            candidates
+        )
+
+    accepted, rejected = apply_filters(
+        candidates,
+        cfg
+    )
+
+    # ------------------------------------------------------------
+    # Store diagnostics
+    # ------------------------------------------------------------
+
+    with state.lock:
+
+        state.last_scan = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        state.last_scan_count = len(
+            candidates
+        )
+
+        state.scan_errors = errors[:20]
+
+        # Show accepted first, then rejected candidates.
+        state.discovered = (
+            accepted[:50]
+            + rejected[:50]
+        )
+
+    state.log(
+        f"SCAN: {len(candidates)} unique candidates / "
+        f"{len(accepted)} passed filters",
+        "sys",
+    )
+
+    for error in errors[:5]:
+        state.log(
+            f"DATA: {error}",
+            "sell-loss",
+        )
+
+    return accepted
+
+
+# ================================================================
 # ENGINE
 # ================================================================
 
 def engine_loop(
-    state: EngineState,
+    state: EngineState
 ):
 
     state.log(
-        "NEON ENGINE ONLINE // background worker started",
+        "Background engine thread started",
         "sys",
     )
-
-    last_scan = 0
 
     while True:
 
         try:
 
             if not state.running:
-
                 time.sleep(2)
                 continue
 
-            current_time = time.time()
+            # ----------------------------------------------------
+            # Daily loss kill switch
+            # ----------------------------------------------------
 
-            # --------------------------------------------
-            # Daily kill switch
-            # --------------------------------------------
+            pnl = daily_pnl(state)
 
-            if (
-                daily_pnl(state)
-                <= -abs(
-                    state.config["daily_loss_limit"]
-                )
+            if pnl <= -abs(
+                state.config["daily_loss_limit"]
             ):
 
                 state.log(
-                    "KILL SWITCH // daily loss limit reached",
+                    "DAILY LOSS LIMIT HIT — ENGINE STOPPED",
                     "sell-loss",
                 )
 
@@ -1731,58 +1703,298 @@ def engine_loop(
 
                 continue
 
-            # --------------------------------------------
-            # Position management
-            # --------------------------------------------
+            # ----------------------------------------------------
+            # Manage positions
+            # ----------------------------------------------------
 
-            manage_positions(state)
+            with state.lock:
+                positions = list(
+                    state.positions
+                )
+                cfg = dict(state.config)
 
-            # --------------------------------------------
-            # Discovery scan
-            # --------------------------------------------
+            for position in positions:
+
+                pnl_pct = get_current_pnl_pct(
+                    state,
+                    position,
+                )
+
+                if state.paper_mode:
+
+                    pnl_pct = (
+                        position.get(
+                            "paper_pnl_pct",
+                            0
+                        )
+                        + random.uniform(
+                            -8,
+                            12
+                        )
+                    )
+
+                    with state.lock:
+                        position["paper_pnl_pct"] = (
+                            pnl_pct
+                        )
+
+                if pnl_pct is None:
+                    continue
+
+                with state.lock:
+
+                    position["peak_pnl_pct"] = max(
+                        position.get(
+                            "peak_pnl_pct",
+                            0
+                        ),
+                        pnl_pct,
+                    )
+
+                    peak = position[
+                        "peak_pnl_pct"
+                    ]
+
+                trailing_trigger = (
+                    peak
+                    - cfg["trailing_stop_pct"]
+                )
+
+                should_close = False
+                reason = ""
+
+                if (
+                    pnl_pct
+                    >= cfg["take_profit_pct"]
+                ):
+
+                    should_close = True
+                    reason = "take profit"
+
+                elif (
+                    peak > 0
+                    and pnl_pct <= trailing_trigger
+                ):
+
+                    should_close = True
+                    reason = "trailing stop"
+
+                elif (
+                    peak <= 0
+                    and pnl_pct
+                    <= -cfg["trailing_stop_pct"]
+                ):
+
+                    should_close = True
+                    reason = "stop loss"
+
+                if should_close:
+
+                    trade = do_sell(
+                        state,
+                        position,
+                    )
+
+                    if trade:
+
+                        with state.lock:
+
+                            if (
+                                position
+                                in state.positions
+                            ):
+                                state.positions.remove(
+                                    position
+                                )
+
+                            state.trades.append(
+                                trade
+                            )
+
+                        tag = (
+                            "sell-win"
+                            if trade["profit"] >= 0
+                            else "sell-loss"
+                        )
+
+                        state.log(
+                            f"CLOSED "
+                            f"{position['symbol']} "
+                            f"({reason}) "
+                            f"{trade['profit']:+.4f} SOL",
+                            tag,
+                        )
+
+                        save_persisted(state)
+
+            # ----------------------------------------------------
+            # Discovery
+            # ----------------------------------------------------
+
+            with state.lock:
+
+                open_count = len(
+                    state.positions
+                )
+
+                cfg = dict(
+                    state.config
+                )
+
+                can_trade = (
+                    state.paper_mode
+                    or state.wallet is not None
+                )
 
             if (
-                current_time - last_scan
-                >= SCAN_INTERVAL_SECONDS
+                open_count
+                < cfg["max_positions"]
+                and can_trade
             ):
 
-                last_scan = current_time
-
-                candidates = discover_all(
+                accepted = discover_tokens(
                     state
                 )
 
-                process_candidates(
-                    state,
-                    candidates,
-                )
+                for token in accepted:
 
-                automatic_entries(
-                    state
-                )
+                    with state.lock:
 
-            time.sleep(2)
+                        if (
+                            len(state.positions)
+                            >= cfg["max_positions"]
+                        ):
+                            break
+
+                        already_holding = any(
+                            p["mint"]
+                            == token["mint"]
+                            for p
+                            in state.positions
+                        )
+
+                    if already_holding:
+                        continue
+
+                    # ------------------------------------------------
+                    # Safety
+                    # ------------------------------------------------
+
+                    ok, reason = safety_check(
+                        token["mint"],
+                        token,
+                        cfg,
+                    )
+
+                    if not ok:
+
+                        state.log(
+                            f"SKIP "
+                            f"{token.get('symbol')} "
+                            f"{reason}",
+                            "sys",
+                        )
+
+                        continue
+
+                    # ------------------------------------------------
+                    # Optional sell simulation
+                    # ------------------------------------------------
+
+                    if cfg[
+                        "require_sell_quote"
+                    ]:
+
+                        if not simulate_sell_check(
+                            token["mint"]
+                        ):
+
+                            state.log(
+                                f"SKIP "
+                                f"{token.get('symbol')}: "
+                                f"no sell route",
+                                "sell-loss",
+                            )
+
+                            continue
+
+                    # ------------------------------------------------
+                    # Buy
+                    # ------------------------------------------------
+
+                    position = do_buy(
+                        state,
+                        token,
+                        cfg["snipe_amount"],
+                    )
+
+                    if position:
+
+                        with state.lock:
+                            state.positions.append(
+                                position
+                            )
+
+                        state.log(
+                            f"BOUGHT "
+                            f"{token.get('symbol')} "
+                            f"score={token.get('score', 0)} "
+                            f"for "
+                            f"{cfg['snipe_amount']} SOL",
+                            "buy",
+                        )
+
+                        save_persisted(
+                            state
+                        )
+
+                        # Don't fill every position from
+                        # one scan immediately.
+                        time.sleep(1)
+
+            time.sleep(
+                SCAN_INTERVAL_SECONDS
+            )
 
         except Exception as exc:
 
             state.log(
-                f"ENGINE ERROR // {exc}",
+                f"ENGINE ERROR: {exc}",
                 "sell-loss",
+            )
+
+            print(
+                traceback.format_exc()
             )
 
             time.sleep(5)
 
 
+# ================================================================
+# IMPORTANT STREAMLIT FIX
+# ================================================================
+
 @st.cache_resource
-def start_engine(
-    state: EngineState,
-):
+def start_engine(_state: EngineState):
+    """
+    CRITICAL FIX.
+
+    The argument is named _state so Streamlit does NOT try to hash
+    EngineState. EngineState contains threading.Lock and mutable
+    objects that Streamlit cannot safely hash/deep-copy.
+
+    This is the fix for:
+
+        TypeError
+        dataclasses.asdict(...)
+        copy.deepcopy(...)
+    """
 
     thread = threading.Thread(
         target=engine_loop,
-        args=(state,),
+        args=(_state,),
         daemon=True,
-        name="CyberSniperEngine",
+        name="cyber-sniper-engine",
     )
 
     thread.start()
@@ -1791,13 +2003,14 @@ def start_engine(
 
 
 # ================================================================
-# UI
+# UI CONFIG
 # ================================================================
 
 st.set_page_config(
-    page_title="CYBER SNIPER // NEON HUNTER",
+    page_title="CYBER SNIPER // NEON PROTOCOL",
     page_icon="🟣",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 
@@ -1814,89 +2027,72 @@ st.markdown(
 );
 
 :root {
-    --cyan: #00ffe6;
-    --pink: #ff00e6;
-    --green: #00ff88;
-    --red: #ff225f;
-    --purple: #8b00ff;
-    --bg: #030008;
+    --cyan:#00ffe7;
+    --pink:#ff00ea;
+    --green:#00ff88;
+    --red:#ff245f;
+    --purple:#7a00ff;
+    --bg:#03020a;
 }
 
 .stApp {
     background:
         radial-gradient(
-            circle at 15% 15%,
+            circle at 20% 20%,
             rgba(255,0,230,.10),
             transparent 35%
         ),
         radial-gradient(
-            circle at 85% 80%,
-            rgba(0,255,230,.08),
-            transparent 35%
+            circle at 80% 70%,
+            rgba(0,255,255,.08),
+            transparent 40%
         ),
-        #030008;
-    color: #e8ffff;
+        #03020a;
+    color:#dffffb;
 }
 
-/* Animated cyber grid */
+/* animated grid */
 
 .stApp::before {
-
-    content: "";
-
-    position: fixed;
-
-    inset: 0;
-
-    pointer-events: none;
-
-    z-index: -2;
+    content:"";
+    position:fixed;
+    inset:0;
+    pointer-events:none;
+    z-index:-3;
 
     background:
         linear-gradient(
-            rgba(0,255,230,.035) 1px,
+            rgba(0,255,231,.035) 1px,
             transparent 1px
         ),
         linear-gradient(
             90deg,
-            rgba(255,0,230,.035) 1px,
+            rgba(0,255,231,.035) 1px,
             transparent 1px
         );
 
-    background-size: 35px 35px;
+    background-size:32px 32px;
 
-    animation:
-        gridmove 18s linear infinite;
+    animation:gridMove 18s linear infinite;
 }
 
-@keyframes gridmove {
-
+@keyframes gridMove {
     from {
-        background-position:
-            0 0,
-            0 0;
+        background-position:0 0,0 0;
     }
-
     to {
-        background-position:
-            0 700px,
-            700px 0;
+        background-position:0 640px,640px 0;
     }
 }
 
-/* Scanlines */
+/* scanlines */
 
 .stApp::after {
-
-    content: "";
-
-    position: fixed;
-
-    inset: 0;
-
-    pointer-events: none;
-
-    z-index: 999;
+    content:"";
+    position:fixed;
+    inset:0;
+    pointer-events:none;
+    z-index:-2;
 
     background:
         repeating-linear-gradient(
@@ -1906,144 +2102,102 @@ st.markdown(
             transparent 2px,
             transparent 4px
         );
-
-    opacity: .45;
 }
 
-/* Header */
+/* header */
 
 .cyber-header {
+    padding:28px;
+    margin-bottom:22px;
 
-    border:
-        1px solid var(--cyan);
-
-    border-radius: 14px;
-
-    padding: 25px;
-
-    text-align: center;
+    border:2px solid var(--pink);
+    border-radius:14px;
 
     background:
         linear-gradient(
             135deg,
-            rgba(5,0,20,.96),
-            rgba(25,0,50,.90)
+            rgba(5,1,15,.95),
+            rgba(25,0,45,.95)
         );
 
     box-shadow:
-        0 0 20px rgba(0,255,230,.35),
-        inset 0 0 30px rgba(255,0,230,.08);
+        0 0 15px rgba(255,0,230,.4),
+        inset 0 0 40px rgba(0,255,231,.05);
 
-    position: relative;
+    text-align:center;
 
-    overflow: hidden;
+    animation:
+        pulseBorder 3s ease-in-out infinite;
 }
 
-.cyber-header::before {
-
-    content: "";
-
-    position: absolute;
-
-    left: -100%;
-
-    top: 0;
-
-    width: 100%;
-
-    height: 2px;
-
-    background:
-        linear-gradient(
-            90deg,
-            transparent,
-            var(--cyan),
-            var(--pink),
-            transparent
-        );
-
-    animation: scan 3s linear infinite;
-}
-
-@keyframes scan {
-
-    0% {
-        left: -100%;
+@keyframes pulseBorder {
+    0%,100% {
+        box-shadow:
+            0 0 15px rgba(255,0,230,.35),
+            inset 0 0 40px rgba(0,255,231,.05);
     }
-
-    100% {
-        left: 100%;
+    50% {
+        box-shadow:
+            0 0 35px rgba(255,0,230,.65),
+            0 0 60px rgba(0,255,231,.12),
+            inset 0 0 40px rgba(0,255,231,.08);
     }
 }
 
 .cyber-title {
-
-    font-family: 'Orbitron', sans-serif;
-
-    color: var(--cyan);
-
-    font-size: 38px;
-
-    letter-spacing: 5px;
+    font-family:'Orbitron',sans-serif;
+    color:var(--cyan);
+    font-size:38px;
+    font-weight:900;
+    letter-spacing:5px;
 
     text-shadow:
-        0 0 8px var(--cyan),
-        0 0 18px var(--pink);
+        0 0 5px #fff,
+        0 0 12px var(--cyan),
+        0 0 30px var(--pink);
 
-    animation:
-        glitch 4s infinite;
+    animation:glitch 4s infinite;
 }
 
 @keyframes glitch {
-
-    0%, 94%, 100% {
-        transform: translate(0);
+    0%,94%,100% {
+        transform:translate(0);
     }
-
     95% {
-        transform: translate(-2px, 1px);
+        transform:translate(-2px,1px);
     }
-
     96% {
-        transform: translate(2px, -1px);
+        transform:translate(2px,-1px);
     }
-
     97% {
-        transform: translate(-1px, 0);
+        transform:translate(-1px,0);
     }
 }
 
 .sub {
-
-    color: var(--pink);
-
-    font-family: 'Share Tech Mono', monospace;
-
-    letter-spacing: 3px;
+    color:var(--pink);
+    font-family:'Share Tech Mono',monospace;
+    letter-spacing:3px;
 }
 
-/* Cards */
+/* cards */
 
 .cyber-card {
-
     background:
         linear-gradient(
             135deg,
-            rgba(7,2,18,.96),
-            rgba(20,0,40,.88)
+            rgba(5,2,15,.96),
+            rgba(18,0,40,.88)
         );
 
-    border:
-        1px solid rgba(0,255,230,.65);
+    border:1px solid var(--cyan);
+    border-radius:10px;
 
-    border-radius: 10px;
-
-    padding: 16px;
-
-    margin: 5px;
+    padding:17px;
+    margin:4px;
 
     box-shadow:
-        0 0 14px rgba(0,255,230,.15);
+        0 0 15px rgba(0,255,231,.15);
 
     transition:
         transform .2s,
@@ -2052,200 +2206,146 @@ st.markdown(
 }
 
 .cyber-card:hover {
+    transform:translateY(-3px);
 
-    transform:
-        translateY(-3px);
-
-    border-color:
-        var(--pink);
+    border-color:var(--pink);
 
     box-shadow:
-        0 0 25px rgba(255,0,230,.35);
+        0 0 30px rgba(255,0,230,.35);
 }
 
 .metric-value {
-
-    color:
-        var(--cyan);
-
-    font-family:
-        'Orbitron', sans-serif;
-
-    font-size:
-        23px;
+    color:var(--cyan);
+    font-family:'Orbitron',sans-serif;
+    font-size:22px;
+    font-weight:800;
 
     text-shadow:
-        0 0 12px var(--cyan);
+        0 0 10px var(--cyan);
 }
 
-/* Terminal */
+/* terminal */
 
 .terminal {
+    background:#000;
 
-    background:
-        #000;
+    border:1px solid var(--green);
+    border-radius:8px;
 
-    border:
-        1px solid var(--green);
+    padding:14px;
 
-    border-radius:
-        8px;
+    height:260px;
+    overflow-y:auto;
 
-    padding:
-        14px;
-
-    height:
-        280px;
-
-    overflow-y:
-        auto;
-
-    font-family:
-        'Share Tech Mono',
-        monospace;
-
-    font-size:
-        12px;
+    font-family:'Share Tech Mono',monospace;
+    font-size:12px;
 
     box-shadow:
         inset 0 0 25px rgba(0,255,136,.12);
 }
 
 .terminal .buy {
-    color: var(--cyan);
+    color:var(--cyan);
 }
 
 .terminal .sell-win {
-    color: var(--green);
+    color:var(--green);
 }
 
 .terminal .sell-loss {
-    color: var(--red);
+    color:var(--red);
 }
 
 .terminal .sys {
-    color: var(--pink);
+    color:var(--pink);
 }
 
-/* Sidebar */
+/* sidebar */
 
 section[data-testid="stSidebar"] {
-
     background:
         linear-gradient(
             180deg,
-            #030008,
+            #04020b,
             #10001f
         );
 
-    border-right:
-        1px solid var(--pink);
+    border-right:1px solid var(--pink);
 }
 
-/* Buttons */
+.sidebar-header {
+    color:var(--cyan);
+    font-family:'Orbitron',sans-serif;
+    font-size:18px;
+    font-weight:900;
+    text-align:center;
 
-.stButton > button {
+    padding:8px;
 
-    background:
-        linear-gradient(
-            135deg,
-            #07000f,
-            #1b0033
-        );
+    letter-spacing:2px;
 
-    color:
-        var(--cyan);
-
-    border:
-        1px solid var(--cyan);
-
-    font-family:
-        'Orbitron',
-        sans-serif;
-
-    letter-spacing:
-        1px;
-
-    transition:
-        all .2s;
-}
-
-.stButton > button:hover {
-
-    color:
-        #000;
-
-    background:
-        linear-gradient(
-            135deg,
-            var(--pink),
-            var(--cyan)
-        );
-
-    box-shadow:
-        0 0 25px
-        rgba(0,255,230,.45);
-}
-
-/* Score bars */
-
-.score-bar {
-
-    height: 7px;
-
-    border-radius: 5px;
-
-    background:
-        #150020;
-
-    overflow:
-        hidden;
-
-    margin:
-        5px 0 10px;
-}
-
-.score-fill {
-
-    height: 100%;
-
-    background:
-        linear-gradient(
-            90deg,
-            var(--pink),
-            var(--cyan)
-        );
-
-    box-shadow:
+    text-shadow:
         0 0 10px var(--cyan);
 }
 
-/* Status */
+/* buttons */
 
-.status-online {
+.stButton > button {
+    background:
+        linear-gradient(
+            135deg,
+            #05010d,
+            #16002c
+        );
 
-    color:
-        var(--green);
+    color:var(--cyan);
 
-    font-family:
-        'Orbitron',
-        sans-serif;
+    border:1px solid var(--cyan);
+    border-radius:7px;
 
-    text-align:
-        center;
+    font-family:'Orbitron',sans-serif;
+    font-weight:700;
 
-    text-shadow:
-        0 0 15px var(--green);
-
-    animation:
-        pulse 2s infinite;
+    transition:.2s;
 }
 
-@keyframes pulse {
+.stButton > button:hover {
+    color:#000;
 
-    50% {
-        opacity: .55;
-    }
+    background:
+        linear-gradient(
+            135deg,
+            var(--pink),
+            var(--cyan)
+        );
+
+    box-shadow:
+        0 0 25px rgba(255,0,230,.55);
+}
+
+/* tables */
+
+[data-testid="stDataFrame"] {
+    border:1px solid var(--cyan);
+}
+
+/* alerts */
+
+.stAlert {
+    background:#0d0020;
+    border:1px solid var(--pink);
+}
+
+/* status */
+
+.online {
+    color:var(--green);
+    text-shadow:0 0 20px var(--green);
+}
+
+.offline {
+    color:var(--red);
+    text-shadow:0 0 20px var(--red);
 }
 
 </style>
@@ -2260,9 +2360,49 @@ section[data-testid="stSidebar"] {
 
 state = get_state()
 
-load_wallet_from_env(state)
-
+# This is safe now because start_engine uses _state.
 start_engine(state)
+
+
+# ================================================================
+# AUTO LOAD WALLET FROM ENV
+# ================================================================
+
+ENV_PRIVATE_KEY = os.getenv(
+    "SOLANA_PRIVATE_KEY",
+    ""
+).strip()
+
+if (
+    ENV_PRIVATE_KEY
+    and state.wallet is None
+):
+
+    try:
+
+        with state.lock:
+
+            state.wallet = (
+                Keypair.from_base58_string(
+                    ENV_PRIVATE_KEY
+                )
+            )
+
+            state.wallet_address = str(
+                state.wallet.pubkey()
+            )
+
+        state.log(
+            "Wallet loaded from environment",
+            "sys",
+        )
+
+    except Exception as exc:
+
+        state.log(
+            f"Wallet load failed: {exc}",
+            "sell-loss",
+        )
 
 
 # ================================================================
@@ -2274,12 +2414,13 @@ st.markdown(
 <div class="cyber-header">
 
 <div class="cyber-title">
-🟣 CYBER SNIPER // NEON HUNTER
+🟣 CYBER SNIPER
 </div>
 
 <div class="sub">
-[ SOLANA ] [ MULTI-SOURCE DISCOVERY ]
-[ RISK MATRIX ] [ PAPER ENGINE ]
+// NEON PROTOCOL //
+MULTI-SOURCE SOLANA DISCOVERY //
+PAPER-FIRST EXECUTION
 </div>
 
 </div>
@@ -2295,125 +2436,166 @@ st.markdown(
 with st.sidebar:
 
     st.markdown(
-        "## ⚡ NEON CONTROL",
+        '<div class="sidebar-header">'
+        '🔑 WALLET ACCESS'
+        '</div>',
+        unsafe_allow_html=True,
     )
-
-    st.caption(
-        "v7.0 // multi-source token intelligence"
-    )
-
-    st.markdown("---")
-
-    # ------------------------------------------------------------
-    # Wallet
-    # ------------------------------------------------------------
-
-    st.markdown("### 🔑 WALLET")
 
     if state.wallet:
 
         st.success(
-            f"{state.wallet_address[:6]}..."
-            f"{state.wallet_address[-4:]}"
+            "Wallet connected"
+        )
+
+        st.caption(
+            f"{state.wallet_address[:8]}"
+            "..."
+            f"{state.wallet_address[-6:]}"
         )
 
     else:
 
-        st.info(
-            "No wallet loaded. "
-            "Paper mode does not require one."
+        key_input = st.text_input(
+            "Private key",
+            type="password",
+            help=(
+                "Prefer SOLANA_PRIVATE_KEY "
+                "in environment/secrets."
+            ),
         )
+
+        if st.button(
+            "CONNECT WALLET"
+        ):
+
+            try:
+
+                wallet = (
+                    Keypair.from_base58_string(
+                        key_input.strip()
+                    )
+                )
+
+                with state.lock:
+
+                    state.wallet = wallet
+                    state.wallet_address = str(
+                        wallet.pubkey()
+                    )
+
+                st.success(
+                    "Wallet connected"
+                )
+
+                st.rerun()
+
+            except Exception as exc:
+
+                st.error(
+                    f"Invalid key: {exc}"
+                )
 
     st.markdown("---")
 
     # ------------------------------------------------------------
-    # Mode
+    # Trading mode
     # ------------------------------------------------------------
 
-    st.markdown("### ⚠️ MODE")
+    st.markdown(
+        '<div class="sidebar-header">'
+        '⚠️ TRADING MODE'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
-    new_paper_mode = st.toggle(
+    paper = st.toggle(
         "PAPER MODE",
         value=state.paper_mode,
     )
 
-    if new_paper_mode != state.paper_mode:
+    if paper != state.paper_mode:
 
         with state.lock:
-            state.paper_mode = new_paper_mode
-
-        state.log(
-            "Trading mode changed",
-            "sys",
-        )
+            state.paper_mode = paper
 
     if not state.paper_mode:
 
-        st.error(
-            "LIVE MODE IS NOT ENABLED BY THIS BUILD."
+        st.warning(
+            "LIVE MODE can submit real transactions."
         )
 
-        st.caption(
-            "Validate discovery and paper execution first."
+        confirmation = st.text_input(
+            'Type "I ACCEPT RISK"',
+            type="password",
         )
 
-        with state.lock:
-            state.paper_mode = True
+        live_unlocked = (
+            confirmation.strip().upper()
+            == "I ACCEPT RISK"
+        )
+
+    else:
+
+        live_unlocked = False
+
+    st.markdown("---")
 
     # ------------------------------------------------------------
     # Strategy
     # ------------------------------------------------------------
 
-    st.markdown("---")
-    st.markdown("### 🎯 STRATEGY")
+    st.markdown(
+        '<div class="sidebar-header">'
+        '🎯 STRATEGY'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
     preset_name = st.selectbox(
         "Preset",
         [
-            "🛡️ Conservative",
-            "⚖️ Moderate",
-            "🔥 Aggressive",
+            "Conservative",
+            "Moderate",
+            "Aggressive",
         ],
         index=1,
     )
 
     presets = {
 
-        "🛡️ Conservative": {
+        "Conservative": {
+            "amount": 0.02,
             "tp": 20,
             "trail": 8,
-            "amount": 0.02,
             "liq": 25000,
-            "volume": 15000,
-            "txns": 150,
-            "score": 75,
-        },
-
-        "⚖️ Moderate": {
-            "tp": 50,
-            "trail": 15,
-            "amount": 0.05,
-            "liq": 15000,
-            "volume": 5000,
-            "txns": 50,
+            "vol": 10000,
             "score": 65,
         },
 
-        "🔥 Aggressive": {
+        "Moderate": {
+            "amount": 0.05,
+            "tp": 50,
+            "trail": 15,
+            "liq": 15000,
+            "vol": 5000,
+            "score": 50,
+        },
+
+        "Aggressive": {
+            "amount": 0.10,
             "tp": 100,
             "trail": 25,
-            "amount": 0.10,
             "liq": 8000,
-            "volume": 2000,
-            "txns": 25,
-            "score": 60,
+            "vol": 2500,
+            "score": 40,
         },
     }
 
     preset = presets[preset_name]
 
     snipe_amount = st.slider(
-        "Paper Position (SOL)",
+        "Buy Amount SOL",
         0.01,
         MAX_TRADE_SOL_CAP,
         float(preset["amount"]),
@@ -2424,7 +2606,7 @@ with st.sidebar:
         "Take Profit %",
         10,
         300,
-        preset["tp"],
+        int(preset["tp"]),
         5,
     )
 
@@ -2432,100 +2614,237 @@ with st.sidebar:
         "Trailing Stop %",
         5,
         50,
-        preset["trail"],
+        int(preset["trail"]),
         5,
     )
 
     min_liquidity = st.number_input(
         "Minimum Liquidity USD",
         1000,
-        500000,
-        preset["liq"],
+        200000,
+        int(preset["liq"]),
         1000,
     )
 
     min_volume = st.number_input(
         "Minimum 24h Volume USD",
         0,
-        10000000,
-        preset["volume"],
-        1000,
-    )
-
-    min_txns = st.number_input(
-        "Minimum 24h Transactions",
-        0,
-        100000,
-        preset["txns"],
-        10,
+        1000000,
+        int(preset["vol"]),
+        500,
     )
 
     min_score = st.slider(
         "Minimum Token Score",
         0,
         100,
-        preset["score"],
+        int(preset["score"]),
+        5,
+    )
+
+    min_age = st.number_input(
+        "Minimum Token Age Minutes",
+        0,
+        10080,
+        0,
+        5,
+    )
+
+    max_age_hours = st.number_input(
+        "Maximum Token Age Hours",
+        1,
+        720,
+        168,
         1,
     )
 
     max_positions = st.slider(
-        "Maximum Positions",
+        "Maximum Open Positions",
         1,
         10,
         5,
     )
 
     daily_loss_limit = st.number_input(
-        "Daily Paper Loss Limit",
+        "Daily Loss Kill Switch SOL",
         0.01,
         10.0,
-        0.2,
+        0.20,
         0.01,
     )
 
     with state.lock:
 
         state.config.update({
-            "snipe_amount": snipe_amount,
-            "take_profit_pct": take_profit,
-            "trailing_stop_pct": trailing_stop,
-            "min_liquidity_usd": min_liquidity,
-            "min_volume_24h": min_volume,
-            "min_txns_24h": min_txns,
-            "min_score": min_score,
-            "max_positions": max_positions,
-            "daily_loss_limit": daily_loss_limit,
+
+            "snipe_amount":
+                snipe_amount,
+
+            "take_profit_pct":
+                float(take_profit),
+
+            "trailing_stop_pct":
+                float(trailing_stop),
+
+            "min_liquidity_usd":
+                float(min_liquidity),
+
+            "min_volume_24h":
+                float(min_volume),
+
+            "min_score":
+                int(min_score),
+
+            "min_token_age_minutes":
+                int(min_age),
+
+            "max_token_age_hours":
+                int(max_age_hours),
+
+            "max_positions":
+                int(max_positions),
+
+            "daily_loss_limit":
+                float(daily_loss_limit),
         })
 
+    st.markdown("---")
+
     # ------------------------------------------------------------
-    # Engine
+    # Sources
     # ------------------------------------------------------------
 
+    st.markdown(
+        '<div class="sidebar-header">'
+        '📡 DATA SOURCES'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    use_dex = st.checkbox(
+        "DEX Screener",
+        True,
+    )
+
+    use_be_new = st.checkbox(
+        "Birdeye New Listings",
+        bool(BIRDEYE_KEY),
+        disabled=not bool(BIRDEYE_KEY),
+    )
+
+    use_be_ranked = st.checkbox(
+        "Birdeye Ranked",
+        bool(BIRDEYE_KEY),
+        disabled=not bool(BIRDEYE_KEY),
+    )
+
+    with state.lock:
+
+        state.config[
+            "use_dexscreener"
+        ] = use_dex
+
+        state.config[
+            "use_birdeye_new"
+        ] = use_be_new
+
+        state.config[
+            "use_birdeye_ranked"
+        ] = use_be_ranked
+
+    if not BIRDEYE_KEY:
+
+        st.caption(
+            "Birdeye disabled: "
+            "set BIRDEYE_API_KEY."
+        )
+
     st.markdown("---")
-    st.markdown("### 🤖 ENGINE")
+
+    # ------------------------------------------------------------
+    # Safety
+    # ------------------------------------------------------------
+
+    st.markdown(
+        '<div class="sidebar-header">'
+        '🛡️ SAFETY'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    require_rugcheck = st.checkbox(
+        "Require RugCheck",
+        False,
+    )
+
+    require_sell = st.checkbox(
+        "Require Jupiter sell route",
+        False,
+    )
+
+    with state.lock:
+
+        state.config[
+            "require_rugcheck"
+        ] = require_rugcheck
+
+        state.config[
+            "require_sell_quote"
+        ] = require_sell
+
+    st.markdown("---")
+
+    # ------------------------------------------------------------
+    # Engine controls
+    # ------------------------------------------------------------
+
+    st.markdown(
+        '<div class="sidebar-header">'
+        '🤖 ENGINE'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    can_start = (
+        state.paper_mode
+        or (
+            state.wallet is not None
+            and live_unlocked
+        )
+    )
 
     if not state.running:
 
         if st.button(
-            "⚡ START SCANNER",
-            width="stretch",
+            "⚡ START ENGINE",
+            disabled=not can_start,
         ):
 
             with state.lock:
+
                 state.running = True
 
+                state.engine_started_at = (
+                    datetime.now().isoformat()
+                )
+
             state.log(
-                "ENGINE ACTIVATED // scanner armed",
+                "ENGINE ACTIVATED",
                 "sys",
             )
 
             st.rerun()
 
+        if not can_start:
+
+            st.caption(
+                "Paper mode or live confirmation required."
+            )
+
     else:
 
         if st.button(
-            "🛑 STOP SCANNER",
-            width="stretch",
+            "🛑 STOP ENGINE"
         ):
 
             with state.lock:
@@ -2539,27 +2858,30 @@ with st.sidebar:
             st.rerun()
 
     if st.button(
-        "🔍 FORCE SCAN",
-        width="stretch",
+        "🔍 FORCE SCAN"
     ):
 
         with st.spinner(
-            "Scanning discovery feeds..."
+            "Scanning sources..."
         ):
 
-            candidates = discover_all(
+            accepted = discover_tokens(
                 state
-            )
-
-            process_candidates(
-                state,
-                candidates,
             )
 
         st.success(
             f"Scan complete: "
-            f"{len(state.discovered)} watch candidates"
+            f"{len(accepted)} passed"
         )
+
+        st.rerun()
+
+    if st.button(
+        "🧹 CLEAR DISCOVERY"
+    ):
+
+        with state.lock:
+            state.discovered = []
 
         st.rerun()
 
@@ -2570,14 +2892,37 @@ with st.sidebar:
 
 with state.lock:
 
-    positions = list(state.positions)
-    trades = list(state.trades)
-    discovered = list(state.discovered)
-    rejected = list(state.rejected)
-    logs = list(state.logs)
-    stats = dict(state.scanner_stats)
+    positions = list(
+        state.positions
+    )
+
+    trades = list(
+        state.trades
+    )
+
+    discovered = list(
+        state.discovered
+    )
+
+    logs = list(
+        state.logs
+    )
+
     running = state.running
-    config = dict(state.config)
+
+    paper_mode = state.paper_mode
+
+    last_scan = state.last_scan
+
+    scan_count = state.last_scan_count
+
+    scan_errors = list(
+        state.scan_errors
+    )
+
+    cfg = dict(
+        state.config
+    )
 
 
 # ================================================================
@@ -2592,13 +2937,14 @@ if state.wallet:
         state.wallet_address
     )
 
-
 total_trades = len(trades)
 
 wins = sum(
     1
     for trade in trades
-    if float(trade.get("profit", 0)) > 0
+    if float(
+        trade.get("profit", 0)
+    ) > 0
 )
 
 win_rate = (
@@ -2608,10 +2954,15 @@ win_rate = (
 )
 
 total_pnl = sum(
-    float(trade.get("profit", 0))
+    float(
+        trade.get("profit", 0)
+    )
     for trade in trades
 )
 
+today_pnl = daily_pnl(
+    state
+)
 
 m1, m2, m3, m4, m5 = st.columns(5)
 
@@ -2620,102 +2971,73 @@ with m1:
     st.markdown(
         f"""
 <div class="cyber-card">
-
-<div style="color:#888">
-BALANCE
-</div>
-
+<div style="color:#888">WALLET</div>
 <div class="metric-value">
-{wallet_balance:.5f} SOL
+{wallet_balance:.4f} SOL
 </div>
-
 </div>
 """,
         unsafe_allow_html=True,
     )
-
 
 with m2:
 
     st.markdown(
         f"""
 <div class="cyber-card">
-
-<div style="color:#888">
-OPEN POSITIONS
-</div>
-
+<div style="color:#888">POSITIONS</div>
 <div class="metric-value">
-{len(positions)}
+{len(positions)}/{cfg['max_positions']}
 </div>
-
 </div>
 """,
         unsafe_allow_html=True,
     )
-
 
 with m3:
 
     st.markdown(
         f"""
 <div class="cyber-card">
-
-<div style="color:#888">
-WATCHLIST
-</div>
-
+<div style="color:#888">DISCOVERED</div>
 <div class="metric-value">
-{len(discovered)}
+{scan_count}
 </div>
-
 </div>
 """,
         unsafe_allow_html=True,
     )
-
 
 with m4:
-
-    st.markdown(
-        f"""
-<div class="cyber-card">
-
-<div style="color:#888">
-WIN RATE
-</div>
-
-<div class="metric-value">
-{win_rate:.1f}%
-</div>
-
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-with m5:
 
     color = (
         "#00ff88"
         if total_pnl >= 0
-        else "#ff225f"
+        else "#ff245f"
     )
 
     st.markdown(
         f"""
 <div class="cyber-card">
-
-<div style="color:#888">
-PAPER P/L
-</div>
-
+<div style="color:#888">NET P/L</div>
 <div class="metric-value"
-     style="color:{color}">
-{total_pnl:+.5f} SOL
+style="color:{color}">
+{total_pnl:+.4f} SOL
 </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
+with m5:
+
+    st.markdown(
+        f"""
+<div class="cyber-card">
+<div style="color:#888">WIN RATE</div>
+<div class="metric-value">
+{win_rate:.1f}%
+</div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -2723,494 +3045,57 @@ PAPER P/L
 
 
 # ================================================================
-# SCANNER STATUS
+# ENGINE STATUS
 # ================================================================
 
-st.markdown("---")
-
-status_col1, status_col2 = st.columns([3, 1])
-
-with status_col1:
-
-    if running:
-
-        st.markdown(
-            """
-<h2 class="status-online">
-🟢 NEON ENGINE ONLINE
-</h2>
-""",
-            unsafe_allow_html=True,
-        )
-
-    else:
-
-        st.markdown(
-            """
-<h2 style="
-text-align:center;
-color:#ff225f;
-font-family:Orbitron;
-">
-🔴 ENGINE STANDBY
-</h2>
-""",
-            unsafe_allow_html=True,
-        )
-
-
-with status_col2:
-
-    st.metric(
-        "Last Scan",
-        stats.get("last_scan") or "--",
-    )
-
-
-# ================================================================
-# DISCOVERY SOURCES
-# ================================================================
-
-st.markdown(
-    "### 📡 DISCOVERY NETWORK"
+status_color = (
+    "#00ff88"
+    if running
+    else "#ff245f"
 )
 
-source_cols = st.columns(4)
-
-sources = [
-    (
-        "DEXSCREENER",
-        "ONLINE",
-        "#00ffe6",
-    ),
-    (
-        "BIRDEYE",
-        "ONLINE" if BIRDEYE_KEY else "NO API KEY",
-        "#ff00e6",
-    ),
-    (
-        "SOLANA RPC",
-        "ONLINE" if HELIUS_KEY else "NO API KEY",
-        "#00ff88",
-    ),
-    (
-        "PAPER ENGINE",
-        "ACTIVE",
-        "#8b00ff",
-    ),
-]
-
-for col, (name, status, color) in zip(
-    source_cols,
-    sources,
-):
-
-    with col:
-
-        st.markdown(
-            f"""
-<div class="cyber-card">
-
-<div style="
-color:{color};
-font-family:Orbitron;
-">
-{name}
-</div>
-
-<div style="
-color:#aaa;
-font-size:12px;
-margin-top:8px;
-">
-● {status}
-</div>
-
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-
-# ================================================================
-# DISCOVERED TOKENS
-# ================================================================
-
-st.markdown("---")
-
-st.markdown(
-    "### 🧬 LIVE TOKEN MATRIX"
+status_text = (
+    "ONLINE"
+    if running
+    else "OFFLINE"
 )
 
-if discovered:
-
-    rows = []
-
-    for token in discovered[:25]:
-
-        score = token.get("score", 0)
-        risk = token.get("risk", 0)
-
-        risk_label = (
-            "LOW"
-            if risk < 25
-            else "MEDIUM"
-            if risk < 50
-            else "HIGH"
-        )
-
-        rows.append({
-            "TOKEN": token.get(
-                "symbol",
-                "UNKNOWN",
-            ),
-
-            "SCORE": score,
-
-            "RISK": risk_label,
-
-            "LIQUIDITY": (
-                f"${token.get('liquidity', 0):,.0f}"
-            ),
-
-            "24H VOLUME": (
-                f"${token.get('volume_24h', 0):,.0f}"
-            ),
-
-            "TXNS": token.get(
-                "txns_24h",
-                0,
-            ),
-
-            "SOURCE": " + ".join(
-                token.get(
-                    "sources",
-                    [],
-                )[:2]
-            ),
-
-            "AGE": (
-                f"{token['age_hours']:.1f}h"
-                if token.get("age_hours")
-                is not None
-                else "?"
-            ),
-        })
-
-    st.dataframe(
-        pd.DataFrame(rows),
-        width="stretch",
-        hide_index=True,
-    )
-
-else:
-
-    st.info(
-        "No candidates yet. "
-        "Use FORCE SCAN or start the scanner."
-    )
-
-
-# ================================================================
-# TOKEN DETAIL CARDS
-# ================================================================
-
-if discovered:
-
-    st.markdown(
-        "### 🎯 TOP SIGNALS"
-    )
-
-    for token in discovered[:6]:
-
-        score = token.get("score", 0)
-        risk = token.get("risk", 0)
-
-        color = (
-            "#00ff88"
-            if score >= 80
-            else "#00ffe6"
-            if score >= 65
-            else "#ff225f"
-        )
-
-        components = token.get(
-            "score_components",
-            {},
-        )
-
-        sources = " + ".join(
-            token.get(
-                "sources",
-                [],
-            )
-        )
-
-        st.markdown(
-            f"""
-<div class="cyber-card"
-     style="text-align:left;">
-
-<div style="
-display:flex;
-justify-content:space-between;
-">
-
-<div>
-
-<span style="
-color:#00ffe6;
-font-family:Orbitron;
-font-size:20px;
-">
-🪙 {token.get('symbol', 'UNKNOWN')}
-</span>
-
-<br>
-
-<span style="
-color:#777;
-font-size:11px;
-">
-{token.get('mint', '')[:10]}...
-{token.get('mint', '')[-8:]}
-</span>
-
-</div>
-
-<div style="
-color:{color};
-font-family:Orbitron;
-font-size:24px;
-">
-{score}/100
-</div>
-
-</div>
-
-<div style="
-color:#aaa;
-margin-top:10px;
-">
-LIQUIDITY:
-${token.get('liquidity',0):,.0f}
-&nbsp; | &nbsp;
-VOLUME:
-${token.get('volume_24h',0):,.0f}
-&nbsp; | &nbsp;
-TXNS:
-{token.get('txns_24h',0):,}
-</div>
-
-<div style="
-color:#ff00e6;
-margin-top:8px;
-font-size:11px;
-">
-SOURCE // {sources}
-</div>
-
-<div style="
-color:#aaa;
-margin-top:8px;
-font-size:11px;
-">
-RISK // {risk}/100
-</div>
-
-<div class="score-bar">
-
-<div class="score-fill"
-style="width:{score}%">
-</div>
-
-</div>
-
-<div style="
-color:#777;
-font-size:10px;
-">
-Liquidity {components.get('liquidity',0):.0f}
-|
-Volume {components.get('volume',0):.0f}
-|
-Activity {components.get('activity',0):.0f}
-|
-Age {components.get('age',0):.0f}
-</div>
-
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-
-# ================================================================
-# REJECTED TOKENS
-# ================================================================
-
-with st.expander(
-    "☠️ REJECTED / HIGH-RISK TOKENS"
-):
-
-    if rejected:
-
-        rejected_rows = []
-
-        for token in rejected[:50]:
-
-            rejected_rows.append({
-                "TOKEN": token.get(
-                    "symbol",
-                    "UNKNOWN",
-                ),
-
-                "SCORE": token.get(
-                    "score",
-                    0,
-                ),
-
-                "RISK": token.get(
-                    "risk",
-                    0,
-                ),
-
-                "REASON": token.get(
-                    "reject_reason",
-                    "unknown",
-                ),
-
-                "LIQUIDITY": (
-                    f"${token.get('liquidity',0):,.0f}"
-                ),
-
-                "MINT": token.get(
-                    "mint",
-                    "",
-                ),
-            })
-
-        st.dataframe(
-            pd.DataFrame(
-                rejected_rows
-            ),
-            width="stretch",
-            hide_index=True,
-        )
-
-    else:
-
-        st.caption(
-            "No rejected candidates recorded."
-        )
-
-
-# ================================================================
-# OPEN POSITIONS
-# ================================================================
-
-st.markdown("---")
-
-st.markdown(
-    "### 📌 OPEN POSITIONS"
+mode = (
+    "PAPER"
+    if paper_mode
+    else "LIVE"
 )
-
-if positions:
-
-    for position in positions:
-
-        pnl = position.get(
-            "peak_pnl_pct",
-            0,
-        )
-
-        color = (
-            "#00ff88"
-            if pnl >= 0
-            else "#ff225f"
-        )
-
-        st.markdown(
-            f"""
-<div class="cyber-card">
-
-<div style="
-color:#00ffe6;
-font-family:Orbitron;
-font-size:18px;
-">
-🎯 {position['symbol']}
-</div>
-
-<div style="
-color:#aaa;
-margin-top:8px;
-">
-ENTRY:
-{position['entry_sol']:.4f} SOL
-</div>
-
-<div style="
-color:{color};
-font-size:20px;
-font-family:Orbitron;
-margin-top:8px;
-">
-{pnl:+.2f}%
-</div>
-
-<div class="score-bar">
-
-<div class="score-fill"
-style="
-width:{min(abs(pnl),100)}%;
-background:
-linear-gradient(
-90deg,
-#ff00e6,
-#00ffe6
-);
-">
-</div>
-
-</div>
-
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-
-else:
-
-    st.info(
-        "No open paper positions."
-    )
-
-
-# ================================================================
-# TERMINAL
-# ================================================================
-
-st.markdown("---")
-
-st.markdown(
-    "### 🖥️ NEON TERMINAL"
-)
-
-terminal_html = "".join(logs)
-
-if not terminal_html:
-
-    terminal_html = (
-        '<div class="sys">'
-        '// awaiting scanner telemetry...'
-        '</div>'
-    )
 
 st.markdown(
     f"""
-<div class="terminal">
-{terminal_html}
+<div style="
+text-align:center;
+padding:12px;
+margin:12px 0;
+border:1px solid {status_color};
+border-radius:8px;
+background:rgba(0,0,0,.35);
+">
+
+<h2 style="
+color:{status_color};
+font-family:Orbitron;
+margin:0;
+text-shadow:0 0 18px {status_color};
+">
+● ENGINE {status_text}
+</h2>
+
+<div style="
+font-family:'Share Tech Mono';
+color:#00ffe7;
+margin-top:5px;
+">
+MODE: {mode}
+&nbsp; // &nbsp;
+LAST SCAN: {last_scan}
+</div>
+
 </div>
 """,
     unsafe_allow_html=True,
@@ -3218,111 +3103,453 @@ st.markdown(
 
 
 # ================================================================
-# SCANNER STATISTICS
+# SCAN DIAGNOSTICS
 # ================================================================
 
-st.markdown("---")
+with st.expander(
+    "📡 SCAN DIAGNOSTICS",
+    expanded=False,
+):
+
+    st.write(
+        f"Raw unique candidates: "
+        f"**{scan_count}**"
+    )
+
+    st.write(
+        f"Currently displayed: "
+        f"**{len(discovered)}**"
+    )
+
+    if scan_errors:
+
+        st.warning(
+            "Some sources reported errors:"
+        )
+
+        for error in scan_errors:
+            st.code(error)
+
+    else:
+
+        st.success(
+            "No source errors recorded."
+        )
+
+    st.caption(
+        "If this says 0 candidates, the problem "
+        "is upstream discovery rather than the "
+        "buy logic."
+    )
+
+
+# ================================================================
+# DISCOVERED TOKENS
+# ================================================================
 
 st.markdown(
-    "### 📊 SCANNER TELEMETRY"
+    "### 🔎 DISCOVERED TOKENS"
 )
 
-c1, c2, c3, c4 = st.columns(4)
+if discovered:
 
-with c1:
-    st.metric(
-        "Scans",
-        stats.get("scans", 0),
+    rows = []
+
+    for token in discovered[:50]:
+
+        rows.append({
+
+            "Score":
+                token.get("score", 0),
+
+            "Symbol":
+                token.get(
+                    "symbol",
+                    "UNKNOWN"
+                ),
+
+            "Liquidity":
+                f"${token.get('liquidity', 0):,.0f}",
+
+            "24h Volume":
+                f"${token.get('volume_24h', 0):,.0f}",
+
+            "Buys":
+                token.get(
+                    "buys_24h",
+                    0
+                ),
+
+            "Sells":
+                token.get(
+                    "sells_24h",
+                    0
+                ),
+
+            "Sources":
+                ", ".join(
+                    token.get(
+                        "sources",
+                        []
+                    )
+                ),
+
+            "Age":
+                (
+                    f"{token['age_minutes']:.0f}m"
+                    if token.get(
+                        "age_minutes"
+                    ) is not None
+                    else "?"
+                ),
+
+            "Mint":
+                token.get(
+                    "mint",
+                    ""
+                ),
+        })
+
+    st.dataframe(
+        pd.DataFrame(rows),
+        use_container_width=True,
+        hide_index=True,
     )
 
-with c2:
-    st.metric(
-        "Raw Candidates",
-        stats.get(
-            "raw_candidates",
-            0,
+    st.caption(
+        "Highest-score candidates appear first."
+    )
+
+else:
+
+    st.info(
+        "No candidates yet. "
+        "Use FORCE SCAN or start the engine."
+    )
+
+
+# ================================================================
+# MANUAL BUY
+# ================================================================
+
+if discovered:
+
+    st.markdown(
+        "### ⚡ MANUAL CANDIDATE ACTION"
+    )
+
+    choices = [
+        x
+        for x in discovered
+        if not x.get(
+            "reject_reason"
+        )
+    ]
+
+    if choices:
+
+        labels = [
+            f"{x.get('symbol', 'UNKNOWN')} "
+            f"// score {x.get('score', 0)} "
+            f"// {x.get('mint', '')[:8]}..."
+            for x in choices[:20]
+        ]
+
+        selected_label = st.selectbox(
+            "Candidate",
+            labels,
+        )
+
+        selected_index = labels.index(
+            selected_label
+        )
+
+        selected = choices[
+            selected_index
+        ]
+
+        if st.button(
+            f"BUY {cfg['snipe_amount']} SOL",
+        ):
+
+            if (
+                not paper_mode
+                and state.wallet is None
+            ):
+
+                st.error(
+                    "No wallet connected."
+                )
+
+            else:
+
+                ok, reason = safety_check(
+                    selected["mint"],
+                    selected,
+                    cfg,
+                )
+
+                if not ok:
+
+                    st.error(reason)
+
+                elif (
+                    cfg[
+                        "require_sell_quote"
+                    ]
+                    and not simulate_sell_check(
+                        selected["mint"]
+                    )
+                ):
+
+                    st.error(
+                        "No Jupiter sell route."
+                    )
+
+                else:
+
+                    position = do_buy(
+                        state,
+                        selected,
+                        cfg["snipe_amount"],
+                    )
+
+                    if position:
+
+                        with state.lock:
+                            state.positions.append(
+                                position
+                            )
+
+                        state.log(
+                            f"MANUAL BUY "
+                            f"{selected.get('symbol')} "
+                            f"score={selected.get('score')}",
+                            "buy",
+                        )
+
+                        save_persisted(
+                            state
+                        )
+
+                        st.success(
+                            "Position opened."
+                        )
+
+                        st.rerun()
+
+                    else:
+
+                        st.error(
+                            "Buy failed. "
+                            "Check quote/API logs."
+                        )
+
+
+# ================================================================
+# POSITIONS
+# ================================================================
+
+st.markdown(
+    "### 📌 OPEN POSITIONS"
+)
+
+if positions:
+
+    position_rows = []
+
+    for position in positions:
+
+        position_rows.append({
+
+            "Symbol":
+                position.get(
+                    "symbol",
+                    "UNKNOWN"
+                ),
+
+            "Entry SOL":
+                position.get(
+                    "entry_sol",
+                    0
+                ),
+
+            "Peak %":
+                position.get(
+                    "peak_pnl_pct",
+                    0
+                ),
+
+            "Score":
+                position.get(
+                    "score",
+                    0
+                ),
+
+            "Opened":
+                position.get(
+                    "opened_at",
+                    ""
+                ),
+        })
+
+    st.dataframe(
+        pd.DataFrame(
+            position_rows
         ),
+        use_container_width=True,
+        hide_index=True,
     )
 
-with c3:
-    st.metric(
-        "Accepted",
-        stats.get(
-            "accepted",
-            0,
-        ),
+    for index, position in enumerate(
+        positions
+    ):
+
+        if st.button(
+            f"SELL {position.get('symbol', 'TOKEN')}",
+            key=f"sell_position_{index}",
+        ):
+
+            trade = do_sell(
+                state,
+                position,
+            )
+
+            if trade:
+
+                with state.lock:
+
+                    if (
+                        position
+                        in state.positions
+                    ):
+                        state.positions.remove(
+                            position
+                        )
+
+                    state.trades.append(
+                        trade
+                    )
+
+                tag = (
+                    "sell-win"
+                    if trade["profit"] >= 0
+                    else "sell-loss"
+                )
+
+                state.log(
+                    f"MANUAL SELL "
+                    f"{position['symbol']} "
+                    f"{trade['profit']:+.4f} SOL",
+                    tag,
+                )
+
+                save_persisted(
+                    state
+                )
+
+                st.rerun()
+
+            else:
+
+                st.error(
+                    "Sell failed."
+                )
+
+else:
+
+    st.info(
+        "No open positions."
     )
 
-with c4:
-    st.metric(
-        "Rejected",
-        stats.get(
-            "rejected",
-            0,
-        ),
-    )
+
+# ================================================================
+# TERMINAL
+# ================================================================
+
+st.markdown(
+    "### 🖥️ NEON TERMINAL"
+)
+
+terminal = "".join(
+    logs
+) or (
+    '<div class="sys">'
+    '// SYSTEM READY //'
+    '</div>'
+)
+
+st.markdown(
+    f'<div class="terminal">{terminal}</div>',
+    unsafe_allow_html=True,
+)
 
 
 # ================================================================
 # TRADE HISTORY
 # ================================================================
 
-st.markdown("---")
-
 st.markdown(
-    "### 📜 PAPER TRADE HISTORY"
+    "### 📜 TRADE HISTORY"
 )
 
 if trades:
 
     trade_rows = []
 
-    for trade in trades[-50:][::-1]:
+    for trade in trades[:100]:
 
         trade_rows.append({
-            "DATE": trade.get(
-                "date",
-                "",
-            ),
 
-            "TIME": trade.get(
-                "time",
-                "",
-            ),
+            "Date":
+                trade.get(
+                    "date",
+                    ""
+                ),
 
-            "TOKEN": trade.get(
-                "symbol",
-                "",
-            ),
+            "Time":
+                trade.get(
+                    "time",
+                    ""
+                ),
 
-            "ENTRY": trade.get(
-                "entry_sol",
-                0,
-            ),
+            "Symbol":
+                trade.get(
+                    "symbol",
+                    ""
+                ),
 
-            "EXIT": trade.get(
-                "exit_sol",
-                0,
-            ),
+            "Entry":
+                trade.get(
+                    "entry_sol",
+                    0
+                ),
 
-            "P/L": trade.get(
-                "profit",
-                0,
-            ),
+            "Exit":
+                trade.get(
+                    "exit_sol",
+                    0
+                ),
+
+            "P/L":
+                trade.get(
+                    "profit",
+                    0
+                ),
         })
 
     st.dataframe(
         pd.DataFrame(
             trade_rows
         ),
-        width="stretch",
+        use_container_width=True,
         hide_index=True,
     )
 
 else:
 
     st.info(
-        "No paper trades yet."
+        "No completed trades yet."
     )
 
 
@@ -3330,19 +3557,19 @@ else:
 # PNL CALENDAR
 # ================================================================
 
-st.markdown("---")
-
 st.markdown(
-    "### 📅 PNL CALENDAR"
+    "### 📅 P/L CALENDAR"
 )
 
-calendar_rows = []
+calendar = []
 
 today = datetime.now()
 
 for i in range(30):
 
-    day = today - timedelta(days=i)
+    day = today - timedelta(
+        days=i
+    )
 
     date_string = day.strftime(
         "%Y-%m-%d"
@@ -3351,55 +3578,72 @@ for i in range(30):
     day_trades = [
         t
         for t in trades
-        if t.get("date") == date_string
+        if t.get("date")
+        == date_string
     ]
 
     pnl = sum(
         float(
-            t.get(
-                "profit",
-                0,
-            )
+            t.get("profit", 0)
         )
         for t in day_trades
     )
 
-    wins_day = sum(
+    day_wins = sum(
         1
         for t in day_trades
         if float(
-            t.get(
-                "profit",
-                0,
-            )
+            t.get("profit", 0)
         ) > 0
     )
 
-    win_rate_day = (
-        wins_day / len(day_trades) * 100
+    day_rate = (
+        day_wins
+        / len(day_trades)
+        * 100
         if day_trades
         else 0
     )
 
-    calendar_rows.append({
-        "DATE": day.strftime(
-            "%m/%d"
-        ),
+    calendar.append({
 
-        "P/L SOL": f"{pnl:+.6f}",
+        "Date":
+            day.strftime("%m/%d"),
 
-        "TRADES": len(day_trades),
+        "P/L SOL":
+            f"{pnl:+.6f}",
 
-        "WIN RATE": (
-            f"{win_rate_day:.0f}%"
-        ),
+        "Trades":
+            len(day_trades),
+
+        "Win Rate":
+            f"{day_rate:.0f}%",
     })
 
 st.dataframe(
-    pd.DataFrame(calendar_rows),
-    width="stretch",
+    pd.DataFrame(calendar),
+    use_container_width=True,
     hide_index=True,
 )
+
+
+# ================================================================
+# REFRESH
+# ================================================================
+
+if HAS_AUTOREFRESH:
+
+    st_autorefresh(
+        interval=6000,
+        key="cyber_sniper_refresh",
+    )
+
+else:
+
+    st.caption(
+        "Install streamlit-autorefresh for "
+        "automatic dashboard refresh."
+    )
 
 
 # ================================================================
@@ -3411,45 +3655,27 @@ st.markdown(
 <div style="
 text-align:center;
 padding:25px;
-color:#00ffe6;
 font-family:'Share Tech Mono';
+color:#00ffe7;
+opacity:.75;
 ">
 
-<div style="
-font-family:Orbitron;
-letter-spacing:3px;
-">
-CYBER SNIPER // NEON HUNTER v7.0
-</div>
+🟣 CYBER SNIPER // NEON PROTOCOL v8.0
 
-<div style="
-font-size:10px;
-color:#777;
-margin-top:8px;
-">
-MULTI-SOURCE DISCOVERY // RISK ENGINE //
-PAPER EXECUTION // SOLANA
-</div>
+<br>
+
+MULTI-SOURCE DISCOVERY //
+DEXSCREENER //
+BIRDEYE //
+JUPITER //
+SOLANA RPC
+
+<br><br>
+
+PAPER MODE FIRST.
+NO FILTER GUARANTEES PROFIT.
 
 </div>
 """,
     unsafe_allow_html=True,
 )
-
-
-# ================================================================
-# AUTO REFRESH
-# ================================================================
-
-if HAS_AUTOREFRESH:
-
-    st_autorefresh(
-        interval=6000,
-        key="cyber_refresh",
-    )
-
-else:
-
-    st.caption(
-        "Install streamlit-autorefresh for automatic dashboard updates."
-    )
