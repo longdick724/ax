@@ -3453,4 +3453,3 @@ else:
     st.caption(
         "Install streamlit-autorefresh for automatic dashboard updates."
     )
-```
