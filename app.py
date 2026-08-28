@@ -1,25 +1,3 @@
-```python
-# ================================================================
-# CYBER SNIPER v7.0 // NEON HUNTER
-# Solana token discovery + paper trading dashboard
-#
-# IMPORTANT:
-#   - PAPER MODE is the default.
-#   - API keys belong in .env, never in this file.
-#   - This program does NOT guarantee token safety or profit.
-#   - New memecoins are extremely high risk.
-#
-# Install:
-#   pip install streamlit requests pandas solders python-dotenv
-#               streamlit-autorefresh
-#
-# Optional:
-#   pip install websocket-client
-#
-# Run:
-#   streamlit run app.py
-# ================================================================
-
 import os
 import json
 import time
