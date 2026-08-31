@@ -900,3 +900,6 @@ if __name__ == '__main__':
     print(f"Toronto Time: {toronto.strftime('%Y-%m-%d %H:%M:%S')} {'EST' if toronto.utcoffset().total_seconds() == -18000 else 'EDT'}\n")
     
     app.run(host="0.0.0.0", port=5000, debug=False)
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
