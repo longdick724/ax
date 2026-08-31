@@ -1,3 +1,5 @@
+# app.py - J.A.R.V.I.S. // Stark Industries HUD - Multi-AI Solana Memecoin Engine
+# Full script ready for GitHub
 import os
 import json
 import time
@@ -261,13 +263,21 @@ if os.path.exists(STATE_FILE):
             d = json.load(f)
         state.positions = d.get("positions", [])
         state.trades = d.get("trades", [])
+        if isinstance(d.get("config"), dict):
+            state.config.update(d["config"])
+        if d.get("config"):
+            state.config.update(d["config"])
     except Exception:
         pass
 
 def save_state():
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump({"positions": state.positions, "trades": state.trades}, f)
+            json.dump({
+                "positions": state.positions,
+                "trades": state.trades,
+                "config": state.config,
+            }, f)
     except Exception:
         pass
 
@@ -706,94 +716,103 @@ HTML_TEMPLATE = r"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap');
 *{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden}
 body{
-  background:#000814;overflow:hidden;height:100vh;
+  background:#000814;height:100vh;
   font-family:'Share Tech Mono',monospace;color:#00d4ff;
+  -webkit-font-smoothing:antialiased;
 }
 canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
+
 .top-bar{
-  position:fixed;top:0;left:0;right:0;height:36px;z-index:20;
-  background:linear-gradient(180deg,rgba(0,40,80,.9),rgba(0,20,40,.6));
-  border-bottom:1px solid rgba(0,180,255,.35);
+  position:fixed;top:0;left:0;right:0;height:52px;z-index:30;
+  background:linear-gradient(180deg,rgba(0,40,80,.95),rgba(0,20,40,.75));
+  border-bottom:1px solid rgba(0,180,255,.4);
   display:flex;align-items:center;justify-content:space-between;
-  padding:0 16px;font-size:11px;letter-spacing:2px
+  padding:0 28px;font-size:15px;letter-spacing:3px
 }
-.top-bar .brand{font-family:'Orbitron',sans-serif;font-weight:700;color:#00e5ff;text-shadow:0 0 12px #00b4ff}
-.top-bar .clock{color:#7fdfff}
+.top-bar .brand{font-family:'Orbitron',sans-serif;font-weight:700;font-size:18px;color:#00e5ff;text-shadow:0 0 16px #00b4ff}
+.top-bar .clock{color:#7fdfff;font-size:15px}
+
 .panel{
-  position:fixed;z-index:15;
-  background:rgba(0,20,45,.78);
-  border:1px solid rgba(0,180,255,.5);
-  box-shadow:0 0 24px rgba(0,150,255,.2),inset 0 0 30px rgba(0,100,200,.08);
-  backdrop-filter:blur(6px);
-  padding:14px 16px;border-radius:2px
+  position:fixed;z-index:20;
+  background:rgba(0,18,42,.85);
+  border:1px solid rgba(0,180,255,.55);
+  box-shadow:0 0 28px rgba(0,150,255,.22),inset 0 0 40px rgba(0,100,200,.1);
+  backdrop-filter:blur(8px);
+  padding:20px 24px;border-radius:4px;min-width:260px
 }
 .panel::before{
-  content:'';position:absolute;top:0;left:0;width:12px;height:12px;
-  border-top:2px solid #00d4ff;border-left:2px solid #00d4ff
+  content:'';position:absolute;top:0;left:0;width:16px;height:16px;
+  border-top:3px solid #00d4ff;border-left:3px solid #00d4ff
 }
 .panel::after{
-  content:'';position:absolute;bottom:0;right:0;width:12px;height:12px;
-  border-bottom:2px solid #00d4ff;border-right:2px solid #00d4ff
+  content:'';position:absolute;bottom:0;right:0;width:16px;height:16px;
+  border-bottom:3px solid #00d4ff;border-right:3px solid #00d4ff
 }
-.pt{font-size:11px;letter-spacing:2px;color:#00b4ff;margin-bottom:4px;opacity:.85;text-transform:uppercase}
-.pv{font-size:24px;font-weight:700;color:#e0f7ff;text-shadow:0 0 10px rgba(0,180,255,.5);font-family:'Orbitron',sans-serif}
-.ps{font-size:11px;color:#4a90b8;margin-top:2px}
-#p-bal{top:52px;left:18px;min-width:180px}
-#p-pos{top:160px;left:18px;min-width:180px}
-#p-wr{top:52px;right:18px;min-width:180px}
-#p-pnl{top:160px;right:18px;min-width:180px}
-#p-time{top:52px;left:50%;transform:translateX(-50%);text-align:center;min-width:200px}
-#p-ai{bottom:220px;left:18px;min-width:180px}
-#p-mkt{bottom:220px;right:18px;min-width:180px}
+.pt{font-size:14px;letter-spacing:3px;color:#00b4ff;margin-bottom:8px;opacity:.9;text-transform:uppercase}
+.pv{font-size:36px;font-weight:700;color:#e8f9ff;text-shadow:0 0 14px rgba(0,180,255,.55);font-family:'Orbitron',sans-serif;line-height:1.15}
+.ps{font-size:14px;color:#5aa0c8;margin-top:6px}
+
+#p-bal{top:70px;left:28px}
+#p-pos{top:210px;left:28px}
+#p-wr{top:70px;right:28px}
+#p-pnl{top:210px;right:28px}
+#p-time{top:70px;left:50%;transform:translateX(-50%);text-align:center;min-width:280px}
+#p-ai{bottom:280px;left:28px}
+#p-mkt{bottom:280px;right:28px}
 #p-logs{
-  bottom:110px;left:18px;width:260px;max-height:120px;overflow:auto;
-  font-size:9px;line-height:1.4;color:#6ab0d0
+  bottom:140px;left:28px;width:340px;max-height:160px;overflow:auto;
+  font-size:13px;line-height:1.45;color:#7ec0e0;min-width:340px
 }
-#p-logs div{opacity:.85;margin-bottom:2px}
+#p-logs div{opacity:.9;margin-bottom:4px}
+
 .gauge-wrap{
-  position:fixed;z-index:14;left:18px;top:280px;
-  display:flex;flex-direction:column;gap:12px
+  position:fixed;z-index:18;left:28px;top:360px;
+  display:flex;flex-direction:column;gap:16px
 }
-.gauge{width:90px;height:90px;position:relative}
+.gauge{width:130px;height:130px;position:relative}
 .gauge canvas{position:absolute;top:0;left:0}
 .gauge .glabel{
   position:absolute;inset:0;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;font-size:8px;color:#00b4ff
+  align-items:center;justify-content:center;font-size:12px;color:#00b4ff
 }
-.gauge .gval{font-size:14px;font-weight:700;color:#fff;font-family:'Orbitron',sans-serif}
+.gauge .gval{font-size:22px;font-weight:700;color:#fff;font-family:'Orbitron',sans-serif}
+
 .core-label{
-  position:fixed;top:50%;left:50%;transform:translate(-50%,200px);
+  position:fixed;top:50%;left:50%;transform:translate(-50%,260px);
   z-index:12;text-align:center;pointer-events:none
 }
 .core-label .main{
-  font-family:'Orbitron',sans-serif;font-size:18px;letter-spacing:8px;
-  color:#00e5ff;text-shadow:0 0 20px #00b4ff
+  font-family:'Orbitron',sans-serif;font-size:26px;letter-spacing:12px;
+  color:#00e5ff;text-shadow:0 0 24px #00b4ff
 }
-.core-label .sub{font-size:9px;color:#4a90b8;letter-spacing:3px;margin-top:4px}
+.core-label .sub{font-size:13px;color:#5aa0c8;letter-spacing:4px;margin-top:8px}
+
 .controls{
-  position:fixed;top:100px;left:50%;transform:translateX(-50%);z-index:25;
-  display:flex;gap:8px
+  position:fixed;top:120px;left:50%;transform:translateX(-50%);z-index:35;
+  display:flex;gap:12px
 }
 .btn{
-  background:rgba(0,30,60,.85);border:1px solid #00b4ff;color:#00d4ff;
-  padding:10px 22px;font-size:12px;letter-spacing:2px;cursor:pointer;
+  background:rgba(0,30,60,.9);border:1px solid #00b4ff;color:#00d4ff;
+  padding:14px 32px;font-size:15px;letter-spacing:3px;cursor:pointer;
   font-family:'Share Tech Mono',monospace;transition:all .2s;
-  box-shadow:0 0 12px rgba(0,150,255,.2)
+  box-shadow:0 0 16px rgba(0,150,255,.25)
 }
-.btn:hover{background:#00b4ff;color:#001020;box-shadow:0 0 20px #00b4ff}
-.btn.active{background:rgba(0,180,255,.25);border-color:#00e5ff}
+.btn:hover{background:#00b4ff;color:#001020;box-shadow:0 0 28px #00b4ff}
+.btn.active{background:rgba(0,180,255,.3);border-color:#00e5ff}
+
 .chat-box{
-  position:fixed;bottom:16px;left:50%;transform:translateX(-50%);
-  width:min(94%,560px);z-index:30;display:flex;flex-direction:column;gap:6px
+  position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+  width:min(94%,720px);z-index:40;display:flex;flex-direction:column;gap:8px
 }
 #messages{
-  max-height:160px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;
-  scrollbar-width:thin;scrollbar-color:rgba(0,180,255,.35) transparent
+  max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;
+  scrollbar-width:thin;scrollbar-color:rgba(0,180,255,.4) transparent
 }
 .msg{
-  background:rgba(0,25,50,.9);border-left:2px solid #00b4ff;
-  padding:9px 14px;font-size:13px;color:#c8e8ff;line-height:1.4;
+  background:rgba(0,25,50,.92);border-left:3px solid #00b4ff;
+  padding:12px 16px;font-size:15px;color:#c8e8ff;line-height:1.45;
   animation:fadeIn .2s ease
 }
 .msg.you{border-left-color:#40a0ff}
@@ -801,25 +820,122 @@ canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
 .msg b{color:#00d4ff}
 .msg.typing{opacity:.65;font-style:italic}
 .chat-input{
-  width:100%;background:rgba(0,20,45,.95);border:1px solid #00b4ff;
-  padding:14px 16px;color:#00d4ff;font-size:14px;outline:none;
+  width:100%;background:rgba(0,20,45,.96);border:1px solid #00b4ff;
+  padding:18px 20px;color:#00d4ff;font-size:16px;outline:none;
   font-family:'Share Tech Mono',monospace;letter-spacing:.5px;
-  box-shadow:0 0 18px rgba(0,150,255,.25)
+  box-shadow:0 0 22px rgba(0,150,255,.28)
 }
-.chat-input:focus{border-color:#00e5ff;box-shadow:0 0 28px rgba(0,180,255,.4)}
+.chat-input:focus{border-color:#00e5ff;box-shadow:0 0 32px rgba(0,180,255,.45)}
 .chat-input::placeholder{color:rgba(0,180,255,.4)}
+
 .footer{
-  position:fixed;bottom:4px;left:50%;transform:translateX(-50%);
-  font-family:'Orbitron',sans-serif;font-size:8px;letter-spacing:4px;
+  position:fixed;bottom:6px;left:50%;transform:translateX(-50%);
+  font-family:'Orbitron',sans-serif;font-size:10px;letter-spacing:5px;
   color:rgba(0,180,255,.35);z-index:10
 }
-@keyframes fadeIn{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
-@media(max-width:768px){
-  .panel{padding:7px 9px;min-width:100px}
-  .pv{font-size:13px}
-  #p-logs,.gauge-wrap,#p-mkt,#p-ai{display:none}
-  .core-label{transform:translate(-50%,100px)}
+
+/* SETTINGS MODAL */
+.settings-overlay{
+  display:none;position:fixed;inset:0;z-index:100;
+  background:rgba(0,8,20,.72);backdrop-filter:blur(6px);
+  align-items:center;justify-content:center
 }
+.settings-overlay.open{display:flex}
+.settings-panel{
+  width:min(92%,520px);background:rgba(0,18,42,.96);
+  border:1px solid rgba(0,180,255,.6);
+  box-shadow:0 0 40px rgba(0,150,255,.3);
+  padding:28px 32px;border-radius:4px;position:relative
+}
+.settings-panel h2{
+  font-family:'Orbitron',sans-serif;font-size:20px;letter-spacing:4px;
+  color:#00e5ff;margin-bottom:20px;text-shadow:0 0 12px #00b4ff
+}
+.set-row{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:14px;gap:16px
+}
+.set-row label{font-size:14px;color:#7ec0e0;letter-spacing:1px;flex:1}
+.set-row input{
+  width:140px;background:rgba(0,30,60,.9);border:1px solid #00b4ff;
+  color:#00e5ff;padding:10px 12px;font-size:15px;font-family:'Share Tech Mono',monospace;
+  outline:none;text-align:right
+}
+.set-row input:focus{border-color:#00e5ff;box-shadow:0 0 12px rgba(0,180,255,.35)}
+.set-actions{display:flex;gap:12px;margin-top:22px;justify-content:flex-end}
+.set-actions .btn{padding:12px 24px;font-size:13px}
+.set-hint{font-size:12px;color:#4a90b8;margin-top:12px;line-height:1.4}
+
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+@media(max-width:900px){
+  .panel{padding:14px 16px;min-width:160px}
+  .pv{font-size:24px}
+  .pt{font-size:11px}
+  #p-logs,.gauge-wrap,#p-mkt{display:none}
+  .core-label{transform:translate(-50%,160px)}
+  .core-label .main{font-size:18px}
+}
+@media(min-width:2560px){
+  .pv{font-size:44px}
+  .pt{font-size:16px}
+  .ps{font-size:16px}
+  .panel{padding:24px 28px;min-width:320px}
+  .btn{padding:16px 36px;font-size:17px}
+  .chat-input{font-size:18px;padding:20px}
+  .msg{font-size:17px}
+  .core-label .main{font-size:32px}
+  .top-bar{height:60px;font-size:17px}
+  .top-bar .brand{font-size:22px}
+}
+@media(min-width:3840px){
+  .pv{font-size:56px}
+  .pt{font-size:20px}
+  .ps{font-size:18px}
+  .panel{padding:28px 34px;min-width:400px}
+  .btn{padding:20px 44px;font-size:20px}
+  .chat-input{font-size:22px;padding:24px}
+  .msg{font-size:20px}
+  .core-label .main{font-size:40px;letter-spacing:16px}
+  .top-bar{height:72px;font-size:20px}
+  .top-bar .brand{font-size:26px}
+  .gauge{width:160px;height:160px}
+}
+
+/* SETTINGS */
+#settings-overlay{
+  display:none;position:fixed;inset:0;z-index:200;
+  background:rgba(0,8,20,.75);backdrop-filter:blur(8px);
+  align-items:center;justify-content:center
+}
+#settings-overlay.open{display:flex}
+.settings-modal{
+  width:min(94%,560px);background:rgba(0,16,40,.97);
+  border:1px solid rgba(0,180,255,.65);
+  box-shadow:0 0 50px rgba(0,150,255,.35);
+  padding:32px 36px;border-radius:4px
+}
+.settings-title{
+  font-family:'Orbitron',sans-serif;font-size:22px;letter-spacing:5px;
+  color:#00e5ff;margin-bottom:24px;text-shadow:0 0 14px #00b4ff
+}
+.settings-grid{
+  display:grid;grid-template-columns:1fr 1fr;gap:16px 20px
+}
+.settings-grid label{
+  display:flex;flex-direction:column;gap:6px;
+  font-size:13px;color:#7ec0e0;letter-spacing:1px
+}
+.settings-grid input{
+  background:rgba(0,30,60,.95);border:1px solid #00b4ff;
+  color:#00e5ff;padding:12px 14px;font-size:16px;
+  font-family:'Share Tech Mono',monospace;outline:none
+}
+.settings-grid input:focus{border-color:#00e5ff;box-shadow:0 0 14px rgba(0,180,255,.4)}
+.settings-actions{display:flex;gap:14px;margin-top:28px;justify-content:flex-end}
+.settings-actions .btn{padding:12px 28px;font-size:14px}
+.settings-hint{margin-top:16px;font-size:13px;color:#4a90b8;line-height:1.4}
+@media(max-width:600px){.settings-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -831,6 +947,45 @@ canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
 <div class="controls">
   <button class="btn" id="btn-toggle" onclick="toggleEngine()">ENGAGE</button>
   <button class="btn" onclick="refreshData()">SCAN</button>
+  <button class="btn" onclick="openSettings()">SETTINGS</button>
+</div>
+
+<!-- TRADE SETTINGS MODAL -->
+<div id="settings-overlay" onclick="if(event.target===this)closeSettings()">
+  <div class="settings-modal">
+    <div class="settings-title">TRADE SETTINGS</div>
+    <div class="settings-grid">
+      <label>Snipe Amount (SOL)
+        <input type="number" id="cfg-snipe" step="0.01" min="0.01" max="1">
+      </label>
+      <label>Take Profit %
+        <input type="number" id="cfg-tp" step="1" min="5" max="500">
+      </label>
+      <label>Trailing Stop %
+        <input type="number" id="cfg-trail" step="1" min="3" max="80">
+      </label>
+      <label>Min Liquidity USD
+        <input type="number" id="cfg-liq" step="100" min="1000" max="500000">
+      </label>
+      <label>Min Volume 24h USD
+        <input type="number" id="cfg-vol" step="100" min="500" max="500000">
+      </label>
+      <label>Min AI/Score
+        <input type="number" id="cfg-score" step="1" min="20" max="95">
+      </label>
+      <label>Max Positions
+        <input type="number" id="cfg-maxpos" step="1" min="1" max="15">
+      </label>
+      <label>Max Trade Cap (SOL)
+        <input type="number" id="cfg-cap" step="0.05" min="0.05" max="5">
+      </label>
+    </div>
+    <div class="settings-actions">
+      <button class="btn" onclick="saveSettings()">SAVE</button>
+      <button class="btn" onclick="closeSettings()">CLOSE</button>
+    </div>
+    <div class="settings-hint">Changes apply to the live engine immediately. Saved in memory for this session.</div>
+  </div>
 </div>
 <div class="panel" id="p-bal">
   <div class="pt">Balance</div>
@@ -868,8 +1023,8 @@ canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
 </div>
 <div class="panel" id="p-logs"></div>
 <div class="gauge-wrap">
-  <div class="gauge" id="g1"><canvas width="90" height="90"></canvas><div class="glabel"><span class="gval" id="g-score">--</span>SCORE</div></div>
-  <div class="gauge" id="g2"><canvas width="90" height="90"></canvas><div class="glabel"><span class="gval" id="g-cpu">--</span>LOAD</div></div>
+  <div class="gauge" id="g1"><canvas width="130" height="130"></canvas><div class="glabel"><span class="gval" id="g-score">--</span>SCORE</div></div>
+  <div class="gauge" id="g2"><canvas width="130" height="130"></canvas><div class="glabel"><span class="gval" id="g-cpu">--</span>LOAD</div></div>
 </div>
 <div class="core-label">
   <div class="main">J.A.R.V.I.S.</div>
@@ -887,8 +1042,16 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 let W, H, CX, CY, t0 = Date.now();
 function resize() {
-  W = canvas.width = window.innerWidth;
-  H = canvas.height = window.innerHeight;
+  const dpr = Math.min(window.devicePixelRatio || 1, 3); // cap for perf, still sharp on 4K/8K
+  const cssW = window.innerWidth;
+  const cssH = window.innerHeight;
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  canvas.width = Math.floor(cssW * dpr);
+  canvas.height = Math.floor(cssH * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  W = cssW;
+  H = cssH;
   CX = W / 2;
   CY = H / 2 - 10;
 }
@@ -1098,7 +1261,7 @@ function drawParticles(t) {
 }
 function drawGauge(canvasEl, value, max, color) {
   const c = canvasEl.getContext('2d');
-  const s = 90, cx = 45, cy = 45, r = 36;
+  const s = 130, cx = 65, cy = 65, r = 52;
   c.clearRect(0, 0, s, s);
   c.beginPath();
   c.arc(cx, cy, r, 0, Math.PI * 2);
@@ -1192,7 +1355,7 @@ function drawWireOrbit(cx, cy, rx, ry, rot, tilt, electronAngles, t) {
     const scale = 1 + zt / 400;
     const px = cx + x * scale;
     const py = cy + yt * scale;
-    const er = 10 + (scale - 1) * 8;
+    const er = 14 + (scale - 1) * 10;
     // wire sphere electron
     drawWireSphere(px, py, er, 6, 8, t * 1.2 + idx, 0.3, 0.9);
     // glow
@@ -1205,7 +1368,7 @@ function drawWireOrbit(cx, cy, rx, ry, rot, tilt, electronAngles, t) {
 }
 
 function drawAtomCore(t) {
-  const R = Math.min(W, H) * 0.11;
+  const R = Math.min(W, H) * 0.18;
   // nucleus wireframe
   drawWireSphere(CX, CY, R * 0.55, 10, 12, t * 0.35, 0.4 + Math.sin(t * 0.2) * 0.1, 1.0);
 
@@ -1284,6 +1447,52 @@ function updateData() {
     document.getElementById('g-cpu').textContent = (d.positions || 0) + '/' + (d.max_positions || 5);
   }).catch(() => {});
 }
+
+function openSettings() {
+  fetch('/api/config').then(r => r.json()).then(cfg => {
+    document.getElementById('cfg-snipe').value = cfg.snipe_amount ?? 0.05;
+    document.getElementById('cfg-tp').value = cfg.take_profit_pct ?? 45;
+    document.getElementById('cfg-trail').value = cfg.trailing_stop_pct ?? 12;
+    document.getElementById('cfg-liq').value = cfg.min_liquidity_usd ?? 12000;
+    document.getElementById('cfg-vol').value = cfg.min_volume_24h ?? 5000;
+    document.getElementById('cfg-score').value = cfg.min_score ?? 58;
+    document.getElementById('cfg-maxpos').value = cfg.max_positions ?? 5;
+    document.getElementById('cfg-cap').value = cfg.max_trade_sol ?? 0.5;
+    document.getElementById('settings-overlay').classList.add('open');
+  }).catch(() => {
+    document.getElementById('settings-overlay').classList.add('open');
+  });
+}
+function closeSettings() {
+  document.getElementById('settings-overlay').classList.remove('open');
+}
+function saveSettings() {
+  const body = {
+    snipe_amount: parseFloat(document.getElementById('cfg-snipe').value),
+    take_profit_pct: parseFloat(document.getElementById('cfg-tp').value),
+    trailing_stop_pct: parseFloat(document.getElementById('cfg-trail').value),
+    min_liquidity_usd: parseFloat(document.getElementById('cfg-liq').value),
+    min_volume_24h: parseFloat(document.getElementById('cfg-vol').value),
+    min_score: parseInt(document.getElementById('cfg-score').value, 10),
+    max_positions: parseInt(document.getElementById('cfg-maxpos').value, 10),
+    max_trade_sol: parseFloat(document.getElementById('cfg-cap').value),
+  };
+  fetch('/api/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  })
+  .then(r => r.json())
+  .then(() => {
+    const box = document.getElementById('messages');
+    box.innerHTML += '<div class="msg jarvis"><b>JARVIS:</b> Trade settings updated and armed.</div>';
+    box.scrollTop = box.scrollHeight;
+    closeSettings();
+    updateData();
+  })
+  .catch(() => alert('Failed to save settings'));
+}
+
 function toggleEngine() {
   fetch('/api/toggle', { method: 'POST' }).then(() => updateData());
 }
@@ -1407,12 +1616,14 @@ def api_config():
     if request.method == "POST":
         data = request.json or {}
         for k in ("snipe_amount", "take_profit_pct", "trailing_stop_pct", "min_liquidity_usd",
-                  "min_volume_24h", "max_positions", "min_score"):
+                  "min_volume_24h", "max_positions", "min_score", "max_trade_sol"):
             if k in data:
                 try:
-                    state.config[k] = type(state.config[k])(data[k])
+                    state.config[k] = type(state.config.get(k, data[k]))(data[k])
                 except Exception:
                     pass
+        save_state()
+        state.log("Settings updated via HUD")
         return jsonify({"ok": True, "config": state.config})
     return jsonify(state.config)
 
