@@ -55,7 +55,16 @@ HELIUS_RPC_URL = (
 JUPITER_API_BASE = "https://quote-api.jup.ag/v6"
 DEXSCREENER_API = "https://api.dexscreener.com"
 BIRDEYE_API = "https://public-api.birdeye.so"
-FREELLM_BASE = "https://api.freellmapi.com/v1"
+FREELLM_BASE = os.getenv("FREELLM_BASE", "https://api.freellmapi.com/v1").rstrip("/")
+FREELLM_BASES = [
+    FREELLM_BASE,
+    "https://api.freellmapi.com/v1",
+    "http://127.0.0.1:3001/v1",
+    "http://localhost:3001/v1",
+]
+# dedupe
+_seen = set()
+FREELLM_BASES = [b for b in FREELLM_BASES if not (b in _seen or _seen.add(b))]
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 STATE_FILE = "jarvis_state.json"
 MAX_TRADE_SOL_CAP = 0.50
@@ -90,9 +99,13 @@ class MultiAIEngine:
         threading.Thread(target=self._bg_test, daemon=True).start()
 
     def _bg_test(self):
-        for mid in list(AI_MODELS.keys())[:5]:
-            self.model_status[mid] = self.query(mid, "Reply: OK", 8) is not None
-            time.sleep(0.25)
+        # Prefer router "auto" then named models
+        for mid in ["auto", "auto:fast"] + list(AI_MODELS.keys())[:4]:
+            ok = self.query(mid, "Reply with only: OK", 8) is not None
+            self.model_status[mid] = ok
+            if ok:
+                break
+            time.sleep(0.2)
 
     def query(self, model: str, prompt: str, max_tokens: int = 300) -> Optional[str]:
         if not self.api_key:
@@ -101,33 +114,37 @@ class MultiAIEngine:
         with self._lock:
             if key in self.cache and time.time() - self.cache[key]["t"] < self.cache_ttl:
                 return self.cache[key]["r"]
-        try:
-            r = requests.post(
-                f"{FREELLM_BASE}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                    "temperature": 0.25,
-                },
-                timeout=18,
-            )
-            if r.status_code == 200:
-                content = (
-                    r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0.25,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        for base in FREELLM_BASES:
+            try:
+                r = requests.post(
+                    f"{base}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=18,
+                    verify=False,
                 )
-                if content:
-                    with self._lock:
-                        self.cache[key] = {"t": time.time(), "r": content}
-                    self.model_status[model] = True
-                    return content
-            self.model_status[model] = False
-        except Exception:
-            self.model_status[model] = False
+                if r.status_code == 200:
+                    content = (
+                        r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+                    )
+                    if content:
+                        with self._lock:
+                            self.cache[key] = {"t": time.time(), "r": content}
+                        self.model_status[model] = True
+                        return content
+            except Exception:
+                continue
+        self.model_status[model] = False
         return None
 
     def get_multi_ai_consensus(self, token_data: Dict) -> Optional[float]:
@@ -178,11 +195,30 @@ class MultiAIEngine:
             "You manage a Solana memecoin trading core. Answer status, risk, strategy."
         )
         full = f"{sys}\n\nUser: {prompt}\nJARVIS:"
-        for m in ["groq/gpt-oss-120b", "openrouter/nemotron-3-super-120b", "groq/compound"]:
+        for m in ["auto", "auto:smart", "groq/gpt-oss-120b", "openrouter/nemotron-3-super-120b", "groq/compound"]:
             r = self.query(m, full, 450)
             if r:
                 return r.strip()
-        return "Core offline. Standing by, sir."
+        # Local fallback when FreeLLM unreachable
+        low = prompt.lower()
+        if any(w in low for w in ("status", "online", "running")):
+            return (
+                f"Engine is {'ONLINE' if state.running else 'STANDBY'}. "
+                f"Positions: {len(state.positions)}. Trades logged: {len(state.trades)}. "
+                "FreeLLM link is down — using local heuristics until the API responds."
+            )
+        if "win" in low or "pnl" in low or "profit" in low:
+            wins = sum(1 for t in state.trades if (t.get('profit') or 0) > 0)
+            total = len(state.trades)
+            net = sum(t.get('profit') or 0 for t in state.trades)
+            wr = (wins / total * 100) if total else 0
+            return f"Win rate {wr:.1f}% ({wins}/{total}). Net P/L {net:+.4f} SOL."
+        if "help" in low or "command" in low:
+            return "Commands: status, win rate, engage engine, positions, strategy. FreeLLM will power deeper analysis when connected."
+        return (
+            "FreeLLM core is unreachable from this host (check FREELLM_BASE / your FreeLLM server). "
+            "HUD, DexScreener, Birdeye, and rule-based scoring remain active. Standing by, sir."
+        )
 
 # ================================================================
 # STATE
@@ -236,7 +272,7 @@ def save_state():
         pass
 
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "JARVIS/20.0 Stark", "Accept": "application/json"})
+HTTP.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Accept": "application/json"})
 
 # ================================================================
 # TOKEN DISCOVERY
@@ -274,10 +310,18 @@ def discover_tokens_multi_source() -> List[Dict]:
     except Exception as e:
         state.log(f"DexScreener: {e}")
 
-    try:
-        r = HTTP.get(f"{DEXSCREENER_API}/latest/dex/search", params={"q": "solana"}, timeout=8)
-        if r.status_code == 200:
-            for pair in ((r.json() or {}).get("pairs") or [])[:25]:
+    # DexScreener multi-query (real pairs)
+    for q in ("SOL", "pump", "bonk", "meme"):
+        try:
+            r = HTTP.get(
+                f"{DEXSCREENER_API}/latest/dex/search",
+                params={"q": q},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                continue
+            pairs = (r.json() or {}).get("pairs") or []
+            for pair in pairs[:20]:
                 if pair.get("chainId") != "solana":
                     continue
                 base = pair.get("baseToken") or {}
@@ -295,8 +339,9 @@ def discover_tokens_multi_source() -> List[Dict]:
                     "price_change_h1": float((pair.get("priceChange") or {}).get("h1") or 0),
                     "source": "dexscreener",
                 })
-    except Exception:
-        pass
+            time.sleep(0.35)  # soft rate limit
+        except Exception:
+            pass
 
     if BIRDEYE_API_KEY:
         headers = {"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"}
@@ -323,33 +368,62 @@ def discover_tokens_multi_source() -> List[Dict]:
             except Exception as e:
                 state.log(f"Birdeye: {e}")
 
-    try:
-        for path in ["/pairs/new_pairs", "/rank/sol/swaps/1h"]:
+    # GMGN real quotation endpoints
+    gmgn_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://gmgn.ai/",
+        "Origin": "https://gmgn.ai",
+    }
+    gmgn_paths = [
+        ("/pairs/new_pairs", {"chain": "sol", "limit": 30}),
+        ("/rank/sol/swaps/1h", {"limit": 30, "orderby": "volume"}),
+        ("/rank/sol/swaps/6h", {"limit": 20}),
+        ("/tokens/sol/trending", {"limit": 20}),
+    ]
+    for path, params in gmgn_paths:
+        try:
             r = HTTP.get(
                 f"https://gmgn.ai/defi/quotation/v1{path}",
-                params={"limit": 20, "chain": "sol"},
-                timeout=8,
+                params=params,
+                headers=gmgn_headers,
+                timeout=10,
             )
-            if r.status_code == 200:
-                data = (r.json() or {}).get("data") or {}
-                items = data.get("pairs") or data.get("rank") or data.get("list") or []
-                if isinstance(items, dict):
-                    items = list(items.values())
-                for p in items[:20]:
-                    if not isinstance(p, dict):
-                        continue
-                    tokens.append({
-                        "mint": p.get("address") or p.get("base_address") or p.get("token_address"),
-                        "symbol": p.get("symbol") or p.get("base_symbol") or "UNKNOWN",
-                        "liquidity": float(p.get("liquidity") or p.get("liquidity_usd") or 0),
-                        "volume_24h": float(p.get("volume_24h") or p.get("volume") or 0),
-                        "buys_24h": int(p.get("buys_24h") or p.get("buys") or 0),
-                        "sells_24h": int(p.get("sells_24h") or p.get("sells") or 0),
-                        "market_cap": float(p.get("market_cap") or p.get("mc") or 0),
-                        "source": "gmgn",
-                    })
-    except Exception:
-        pass
+            if r.status_code != 200:
+                continue
+            body = r.json() or {}
+            data = body.get("data") or body
+            items = (
+                data.get("pairs")
+                or data.get("rank")
+                or data.get("list")
+                or data.get("tokens")
+                or (data if isinstance(data, list) else [])
+            )
+            if isinstance(items, dict):
+                items = list(items.values())
+            for p in items[:25]:
+                if not isinstance(p, dict):
+                    continue
+                mint = (
+                    p.get("address")
+                    or p.get("base_address")
+                    or p.get("token_address")
+                    or p.get("base_token_address")
+                    or (p.get("base_token") or {}).get("address")
+                )
+                tokens.append({
+                    "mint": mint,
+                    "symbol": p.get("symbol") or p.get("base_symbol") or p.get("token_symbol") or "UNKNOWN",
+                    "liquidity": float(p.get("liquidity") or p.get("liquidity_usd") or p.get("liq") or 0),
+                    "volume_24h": float(p.get("volume_24h") or p.get("volume") or p.get("v24h") or 0),
+                    "buys_24h": int(p.get("buys_24h") or p.get("buys") or p.get("buy_count") or 0),
+                    "sells_24h": int(p.get("sells_24h") or p.get("sells") or p.get("sell_count") or 0),
+                    "market_cap": float(p.get("market_cap") or p.get("mc") or p.get("fdv") or 0),
+                    "source": "gmgn",
+                })
+        except Exception:
+            pass
 
     best: Dict[str, Dict] = {}
     for t in tokens:
@@ -648,11 +722,11 @@ canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
 .top-bar .clock{color:#7fdfff}
 .panel{
   position:fixed;z-index:15;
-  background:rgba(0,20,45,.72);
-  border:1px solid rgba(0,180,255,.4);
-  box-shadow:0 0 20px rgba(0,150,255,.15),inset 0 0 30px rgba(0,100,200,.08);
+  background:rgba(0,20,45,.78);
+  border:1px solid rgba(0,180,255,.5);
+  box-shadow:0 0 24px rgba(0,150,255,.2),inset 0 0 30px rgba(0,100,200,.08);
   backdrop-filter:blur(6px);
-  padding:10px 12px;border-radius:2px
+  padding:14px 16px;border-radius:2px
 }
 .panel::before{
   content:'';position:absolute;top:0;left:0;width:12px;height:12px;
@@ -662,26 +736,26 @@ canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
   content:'';position:absolute;bottom:0;right:0;width:12px;height:12px;
   border-bottom:2px solid #00d4ff;border-right:2px solid #00d4ff
 }
-.pt{font-size:9px;letter-spacing:2px;color:#00b4ff;margin-bottom:4px;opacity:.85;text-transform:uppercase}
-.pv{font-size:18px;font-weight:700;color:#e0f7ff;text-shadow:0 0 10px rgba(0,180,255,.5);font-family:'Orbitron',sans-serif}
-.ps{font-size:9px;color:#4a90b8;margin-top:2px}
-#p-bal{top:50px;left:14px;min-width:140px}
-#p-pos{top:140px;left:14px;min-width:140px}
-#p-wr{top:50px;right:14px;min-width:140px}
-#p-pnl{top:140px;right:14px;min-width:140px}
-#p-time{top:50px;left:50%;transform:translateX(-50%);text-align:center;min-width:160px}
-#p-ai{bottom:200px;left:14px;min-width:140px}
-#p-mkt{bottom:200px;right:14px;min-width:150px}
+.pt{font-size:11px;letter-spacing:2px;color:#00b4ff;margin-bottom:4px;opacity:.85;text-transform:uppercase}
+.pv{font-size:24px;font-weight:700;color:#e0f7ff;text-shadow:0 0 10px rgba(0,180,255,.5);font-family:'Orbitron',sans-serif}
+.ps{font-size:11px;color:#4a90b8;margin-top:2px}
+#p-bal{top:52px;left:18px;min-width:180px}
+#p-pos{top:160px;left:18px;min-width:180px}
+#p-wr{top:52px;right:18px;min-width:180px}
+#p-pnl{top:160px;right:18px;min-width:180px}
+#p-time{top:52px;left:50%;transform:translateX(-50%);text-align:center;min-width:200px}
+#p-ai{bottom:220px;left:18px;min-width:180px}
+#p-mkt{bottom:220px;right:18px;min-width:180px}
 #p-logs{
-  bottom:100px;left:14px;width:220px;max-height:90px;overflow:auto;
+  bottom:110px;left:18px;width:260px;max-height:120px;overflow:auto;
   font-size:9px;line-height:1.4;color:#6ab0d0
 }
 #p-logs div{opacity:.85;margin-bottom:2px}
 .gauge-wrap{
-  position:fixed;z-index:14;left:14px;top:240px;
+  position:fixed;z-index:14;left:18px;top:280px;
   display:flex;flex-direction:column;gap:12px
 }
-.gauge{width:70px;height:70px;position:relative}
+.gauge{width:90px;height:90px;position:relative}
 .gauge canvas{position:absolute;top:0;left:0}
 .gauge .glabel{
   position:absolute;inset:0;display:flex;flex-direction:column;
@@ -689,11 +763,11 @@ canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
 }
 .gauge .gval{font-size:14px;font-weight:700;color:#fff;font-family:'Orbitron',sans-serif}
 .core-label{
-  position:fixed;top:50%;left:50%;transform:translate(-50%,140px);
+  position:fixed;top:50%;left:50%;transform:translate(-50%,200px);
   z-index:12;text-align:center;pointer-events:none
 }
 .core-label .main{
-  font-family:'Orbitron',sans-serif;font-size:13px;letter-spacing:6px;
+  font-family:'Orbitron',sans-serif;font-size:18px;letter-spacing:8px;
   color:#00e5ff;text-shadow:0 0 20px #00b4ff
 }
 .core-label .sub{font-size:9px;color:#4a90b8;letter-spacing:3px;margin-top:4px}
@@ -703,7 +777,7 @@ canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
 }
 .btn{
   background:rgba(0,30,60,.85);border:1px solid #00b4ff;color:#00d4ff;
-  padding:8px 16px;font-size:10px;letter-spacing:2px;cursor:pointer;
+  padding:10px 22px;font-size:12px;letter-spacing:2px;cursor:pointer;
   font-family:'Share Tech Mono',monospace;transition:all .2s;
   box-shadow:0 0 12px rgba(0,150,255,.2)
 }
@@ -711,15 +785,15 @@ canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
 .btn.active{background:rgba(0,180,255,.25);border-color:#00e5ff}
 .chat-box{
   position:fixed;bottom:16px;left:50%;transform:translateX(-50%);
-  width:min(94%,480px);z-index:30;display:flex;flex-direction:column;gap:6px
+  width:min(94%,560px);z-index:30;display:flex;flex-direction:column;gap:6px
 }
 #messages{
-  max-height:140px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;
+  max-height:160px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;
   scrollbar-width:thin;scrollbar-color:rgba(0,180,255,.35) transparent
 }
 .msg{
   background:rgba(0,25,50,.9);border-left:2px solid #00b4ff;
-  padding:7px 11px;font-size:11px;color:#c8e8ff;line-height:1.4;
+  padding:9px 14px;font-size:13px;color:#c8e8ff;line-height:1.4;
   animation:fadeIn .2s ease
 }
 .msg.you{border-left-color:#40a0ff}
@@ -728,7 +802,7 @@ canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
 .msg.typing{opacity:.65;font-style:italic}
 .chat-input{
   width:100%;background:rgba(0,20,45,.95);border:1px solid #00b4ff;
-  padding:11px 14px;color:#00d4ff;font-size:12px;outline:none;
+  padding:14px 16px;color:#00d4ff;font-size:14px;outline:none;
   font-family:'Share Tech Mono',monospace;letter-spacing:.5px;
   box-shadow:0 0 18px rgba(0,150,255,.25)
 }
@@ -794,8 +868,8 @@ canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
 </div>
 <div class="panel" id="p-logs"></div>
 <div class="gauge-wrap">
-  <div class="gauge" id="g1"><canvas width="70" height="70"></canvas><div class="glabel"><span class="gval" id="g-score">--</span>SCORE</div></div>
-  <div class="gauge" id="g2"><canvas width="70" height="70"></canvas><div class="glabel"><span class="gval" id="g-cpu">--</span>LOAD</div></div>
+  <div class="gauge" id="g1"><canvas width="90" height="90"></canvas><div class="glabel"><span class="gval" id="g-score">--</span>SCORE</div></div>
+  <div class="gauge" id="g2"><canvas width="90" height="90"></canvas><div class="glabel"><span class="gval" id="g-cpu">--</span>LOAD</div></div>
 </div>
 <div class="core-label">
   <div class="main">J.A.R.V.I.S.</div>
@@ -1024,7 +1098,7 @@ function drawParticles(t) {
 }
 function drawGauge(canvasEl, value, max, color) {
   const c = canvasEl.getContext('2d');
-  const s = 70, cx = 35, cy = 35, r = 28;
+  const s = 90, cx = 45, cy = 45, r = 36;
   c.clearRect(0, 0, s, s);
   c.beginPath();
   c.arc(cx, cy, r, 0, Math.PI * 2);
@@ -1039,6 +1113,121 @@ function drawGauge(canvasEl, value, max, color) {
   c.lineCap = 'round';
   c.stroke();
 }
+
+// ========== WIREFRAME ATOM (center) ==========
+function drawWireSphere(cx, cy, radius, latStep, lonStep, rotY, rotX, alpha) {
+  // latitude lines
+  for (let i = 1; i < latStep; i++) {
+    const phi = (i / latStep) * Math.PI;
+    const r = radius * Math.sin(phi);
+    const y = cy - radius * Math.cos(phi);
+    ctx.beginPath();
+    for (let j = 0; j <= 48; j++) {
+      const th = (j / 48) * Math.PI * 2 + rotY;
+      // simple Y-rotation perspective
+      const x3 = r * Math.cos(th);
+      const z3 = r * Math.sin(th);
+      // tilt X
+      const y3 = (y - cy);
+      const y2 = y3 * Math.cos(rotX) - z3 * Math.sin(rotX);
+      const z2 = y3 * Math.sin(rotX) + z3 * Math.cos(rotX);
+      const scale = 1 + z2 / (radius * 4);
+      const px = cx + x3 * scale;
+      const py = cy + y2 * scale;
+      if (j === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.strokeStyle = `rgba(0,200,255,${alpha * 0.55})`;
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+  }
+  // longitude lines
+  for (let i = 0; i < lonStep; i++) {
+    const th0 = (i / lonStep) * Math.PI * 2 + rotY;
+    ctx.beginPath();
+    for (let j = 0; j <= 32; j++) {
+      const phi = (j / 32) * Math.PI;
+      const r = radius * Math.sin(phi);
+      const y3 = -radius * Math.cos(phi);
+      const x3 = r * Math.cos(th0);
+      const z3 = r * Math.sin(th0);
+      const y2 = y3 * Math.cos(rotX) - z3 * Math.sin(rotX);
+      const z2 = y3 * Math.sin(rotX) + z3 * Math.cos(rotX);
+      const scale = 1 + z2 / (radius * 4);
+      const px = cx + x3 * scale;
+      const py = cy + y2 * scale;
+      if (j === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.strokeStyle = `rgba(0,180,255,${alpha * 0.45})`;
+    ctx.lineWidth = 0.7;
+    ctx.stroke();
+  }
+}
+
+function drawWireOrbit(cx, cy, rx, ry, rot, tilt, electronAngles, t) {
+  // elliptical orbit path
+  ctx.beginPath();
+  for (let i = 0; i <= 64; i++) {
+    const a = (i / 64) * Math.PI * 2 + rot;
+    const x = Math.cos(a) * rx;
+    const y = Math.sin(a) * ry;
+    // tilt around X
+    const yt = y * Math.cos(tilt);
+    const zt = y * Math.sin(tilt);
+    const scale = 1 + zt / 400;
+    const px = cx + x * scale;
+    const py = cy + yt * scale;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.strokeStyle = 'rgba(180,230,255,0.75)';
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+
+  // electrons on orbit
+  electronAngles.forEach((ea, idx) => {
+    const a = ea + rot + t * (0.4 + idx * 0.15);
+    const x = Math.cos(a) * rx;
+    const y = Math.sin(a) * ry;
+    const yt = y * Math.cos(tilt);
+    const zt = y * Math.sin(tilt);
+    const scale = 1 + zt / 400;
+    const px = cx + x * scale;
+    const py = cy + yt * scale;
+    const er = 10 + (scale - 1) * 8;
+    // wire sphere electron
+    drawWireSphere(px, py, er, 6, 8, t * 1.2 + idx, 0.3, 0.9);
+    // glow
+    ctx.beginPath();
+    ctx.arc(px, py, er + 4, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(0,220,255,0.25)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  });
+}
+
+function drawAtomCore(t) {
+  const R = Math.min(W, H) * 0.11;
+  // nucleus wireframe
+  drawWireSphere(CX, CY, R * 0.55, 10, 12, t * 0.35, 0.4 + Math.sin(t * 0.2) * 0.1, 1.0);
+
+  // three classic atom orbits at different tilts
+  const orbits = [
+    { rx: R * 2.2, ry: R * 0.7, rot: t * 0.5, tilt: 0.9, electrons: [0, Math.PI] },
+    { rx: R * 2.2, ry: R * 0.7, rot: -t * 0.4 + 1.0, tilt: -0.7, electrons: [0.5, Math.PI + 0.5] },
+    { rx: R * 2.0, ry: R * 0.55, rot: t * 0.3 + 2.0, tilt: 0.15, electrons: [1.2, Math.PI + 1.2, 0] },
+  ];
+  orbits.forEach(o => drawWireOrbit(CX, CY, o.rx, o.ry, o.rot, o.tilt, o.electrons, t));
+
+  // faint outer guide rings
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath();
+    ctx.ellipse(CX, CY, R * (2.6 + i * 0.35), R * (2.6 + i * 0.35) * 0.35, t * 0.05 * (i % 2 ? 1 : -1), 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(0,160,255,${0.12 - i * 0.03})`;
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+  }
+}
+
+
 function animate() {
   const t = (Date.now() - t0) / 1000;
   ctx.fillStyle = '#000814';
@@ -1046,11 +1235,9 @@ function animate() {
   drawGrid(t);
   drawParticles(t);
   drawCircuitLines(t);
-  drawStarkRings(t);
-  drawOrbitals(t);
   drawDNA(t, 1);
   drawDNA(t, -1);
-  drawCore(t);
+  drawAtomCore(t);
   requestAnimationFrame(animate);
 }
 animate();
@@ -1070,7 +1257,8 @@ function updateData() {
     document.getElementById('toronto-time').textContent = d.toronto_time || '--';
     document.getElementById('tz-label').textContent = d.timezone || 'EST/EDT';
     document.getElementById('top-clock').textContent = (d.toronto_time || '') + ' ' + (d.timezone || '');
-    document.getElementById('ai-ready').textContent = d.ai_ready || 0;
+    document.getElementById('ai-ready').textContent = d.freellm_ok ? (d.ai_ready + ' OK') : 'LOCAL';
+    document.getElementById('ai-ready').style.color = d.freellm_ok ? '#40ffc0' : '#ffaa40';
     document.getElementById('top-status').textContent = d.running ? 'SYSTEM ONLINE' : 'SYSTEM STANDBY';
     document.getElementById('btn-toggle').textContent = d.running ? 'DISENGAGE' : 'ENGAGE';
     document.getElementById('btn-toggle').classList.toggle('active', d.running);
@@ -1174,6 +1362,7 @@ def api_status():
     wr = (wins / total * 100) if total else 0.0
     net = sum(t.get("profit") or 0 for t in state.trades)
     ai_ready = sum(1 for v in getattr(ai_engine_global, "model_status", {}).values() if v)
+    freellm_ok = ai_ready > 0
     with state.lock:
         logs = list(state.logs[-12:])
     return jsonify({
@@ -1192,6 +1381,7 @@ def api_status():
         "toronto_time": toronto.strftime("%H:%M:%S"),
         "timezone": tz_label,
         "ai_ready": ai_ready,
+        "freellm_ok": freellm_ok,
         "logs": logs,
         "version": APP_VERSION,
     })
@@ -1248,7 +1438,9 @@ def main():
     print(f"\nJ.A.R.V.I.S. {APP_VERSION}")
     print(f"http://0.0.0.0:5000")
     print(f"Toronto: {toronto.strftime('%Y-%m-%d %H:%M:%S')} {tz}")
-    print(f"FreeLLM: {'OK' if FREELLM_API_KEY else 'MISSING'}")
+    print(f"FreeLLM key: {'set' if FREELLM_API_KEY else 'MISSING'}")
+    print(f"FreeLLM base: {FREELLM_BASE}")
+    print("Tip: if AI shows LOCAL, set FREELLM_BASE to your FreeLLM server (e.g. http://127.0.0.1:3001/v1)")
     print(f"Birdeye: {'OK' if BIRDEYE_API_KEY else 'MISSING'}\n")
 
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False, use_reloader=False)
