@@ -1,4 +1,5 @@
 flask
+gunicorn
 requests
 solders
 python-dotenv
