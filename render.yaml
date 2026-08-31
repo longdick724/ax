@@ -1,15 +1,17 @@
 services:
   - type: web
-    name: jarvis-sniper
-    env: python
+    name: jarvis-stark
+    runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
     envVars:
+      - key: FREELLM_API_KEY
+        sync: false
+      - key: FREELLM_BASE
+        sync: false
+      - key: BIRDEYE_API_KEY
+        sync: false
       - key: HELIUS_KEY
         sync: false
       - key: SOLANA_PRIVATE_KEY
-        sync: false
-      - key: FREELLM_API_KEY
-        sync: false
-      - key: BIRDEYE_API_KEY
         sync: false
