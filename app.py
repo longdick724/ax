@@ -1,5 +1,3 @@
-# app.py - J.A.R.V.I.S. // Stark Industries HUD - Multi-AI Solana Memecoin Engine
-# Full script ready for GitHub
 import os
 import json
 import time
@@ -41,32 +39,77 @@ def get_toronto_time():
     is_dst = march_2nd_sun.replace(tzinfo=timezone.utc) <= now < nov_1st_sun.replace(tzinfo=timezone.utc)
     return now.astimezone(timezone(timedelta(hours=-4 if is_dst else -5)))
 
-HELIUS_KEY = os.getenv("HELIUS_KEY", "").strip()
-FREELLM_API_KEY = os.getenv(
-    "FREELLM_API_KEY",
-    "freellmapi-9cb5353c69c403f8fe383633e4bf373d4c8838d3feef63ee",
-).strip()
-ENV_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "").strip()
-BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "c86fe0a2e3ad4af2b5409d49a81f3cf8").strip()
+# Mutable secrets (env defaults + editable via Settings UI)
+SECRETS = {
+    "HELIUS_KEY": os.getenv("HELIUS_KEY", "").strip(),
+    "FREELLM_API_KEY": os.getenv(
+        "FREELLM_API_KEY",
+        "freellmapi-9cb5353c69c403f8fe383633e4bf373d4c8838d3feef63ee",
+    ).strip(),
+    "FREELLM_BASE": os.getenv("FREELLM_BASE", "https://api.freellmapi.com/v1").rstrip("/"),
+    "BIRDEYE_API_KEY": os.getenv("BIRDEYE_API_KEY", "c86fe0a2e3ad4af2b5409d49a81f3cf8").strip(),
+    "SOLANA_PRIVATE_KEY": os.getenv("SOLANA_PRIVATE_KEY", "").strip(),
+}
 
-HELIUS_RPC_URL = (
-    f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
-    if HELIUS_KEY
-    else "https://api.mainnet-beta.solana.com"
-)
+def get_helius_rpc() -> str:
+    k = SECRETS.get("HELIUS_KEY") or ""
+    if k:
+        return f"https://mainnet.helius-rpc.com/?api-key={k}"
+    return "https://api.mainnet-beta.solana.com"
+
+def get_freellm_bases() -> list:
+    base = (SECRETS.get("FREELLM_BASE") or "").rstrip("/")
+    bases = [base, "https://api.freellmapi.com/v1", "http://127.0.0.1:3001/v1", "http://localhost:3001/v1"]
+    seen = set()
+    out = []
+    for b in bases:
+        if b and b not in seen:
+            seen.add(b)
+            out.append(b)
+    return out
+
+# Back-compat aliases (updated when SECRETS change)
+HELIUS_KEY = SECRETS["HELIUS_KEY"]
+FREELLM_API_KEY = SECRETS["FREELLM_API_KEY"]
+ENV_PRIVATE_KEY = SECRETS["SOLANA_PRIVATE_KEY"]
+BIRDEYE_API_KEY = SECRETS["BIRDEYE_API_KEY"]
+HELIUS_RPC_URL = get_helius_rpc()
+FREELLM_BASE = SECRETS["FREELLM_BASE"]
+FREELLM_BASES = get_freellm_bases()
 JUPITER_API_BASE = "https://quote-api.jup.ag/v6"
 DEXSCREENER_API = "https://api.dexscreener.com"
 BIRDEYE_API = "https://public-api.birdeye.so"
-FREELLM_BASE = os.getenv("FREELLM_BASE", "https://api.freellmapi.com/v1").rstrip("/")
-FREELLM_BASES = [
-    FREELLM_BASE,
-    "https://api.freellmapi.com/v1",
-    "http://127.0.0.1:3001/v1",
-    "http://localhost:3001/v1",
-]
-# dedupe
-_seen = set()
-FREELLM_BASES = [b for b in FREELLM_BASES if not (b in _seen or _seen.add(b))]
+
+def apply_secrets(updates: dict):
+    """Apply Settings UI secret changes at runtime."""
+    global HELIUS_KEY, FREELLM_API_KEY, ENV_PRIVATE_KEY, BIRDEYE_API_KEY
+    global HELIUS_RPC_URL, FREELLM_BASE, FREELLM_BASES, ai_engine_global
+    for k, v in updates.items():
+        if k in SECRETS and v is not None:
+            val = str(v).strip()
+            # skip masked placeholders
+            if val and not val.startswith("••••") and val != "(unchanged)":
+                SECRETS[k] = val
+    HELIUS_KEY = SECRETS["HELIUS_KEY"]
+    FREELLM_API_KEY = SECRETS["FREELLM_API_KEY"]
+    ENV_PRIVATE_KEY = SECRETS["SOLANA_PRIVATE_KEY"]
+    BIRDEYE_API_KEY = SECRETS["BIRDEYE_API_KEY"]
+    HELIUS_RPC_URL = get_helius_rpc()
+    FREELLM_BASE = SECRETS["FREELLM_BASE"]
+    FREELLM_BASES = get_freellm_bases()
+    # refresh AI engine key
+    if ai_engine_global is not None:
+        ai_engine_global.api_key = FREELLM_API_KEY
+        threading.Thread(target=ai_engine_global._bg_test, daemon=True).start()
+    # wallet reconnect if key set
+    if ENV_PRIVATE_KEY and SOLDERS_AVAILABLE:
+        try:
+            state.wallet = Keypair.from_base58_string(ENV_PRIVATE_KEY)
+            state.wallet_address = str(state.wallet.pubkey())
+            state.log(f"Wallet linked: {state.wallet_address[:8]}...")
+        except Exception as e:
+            state.log(f"Wallet key error: {e}")
+
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 STATE_FILE = "jarvis_state.json"
 MAX_TRADE_SOL_CAP = 0.50
@@ -126,7 +169,7 @@ class MultiAIEngine:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        for base in FREELLM_BASES:
+        for base in get_freellm_bases():
             try:
                 r = requests.post(
                     f"{base}/chat/completions",
@@ -265,6 +308,18 @@ if os.path.exists(STATE_FILE):
         state.trades = d.get("trades", [])
         if isinstance(d.get("config"), dict):
             state.config.update(d["config"])
+        if isinstance(d.get("secrets"), dict):
+            for sk, sv in d["secrets"].items():
+                if sk in SECRETS and sv:
+                    SECRETS[sk] = str(sv).strip()
+            # refresh aliases at module level (no global keyword needed)
+            globals()["HELIUS_KEY"] = SECRETS["HELIUS_KEY"]
+            globals()["FREELLM_API_KEY"] = SECRETS["FREELLM_API_KEY"]
+            globals()["ENV_PRIVATE_KEY"] = SECRETS["SOLANA_PRIVATE_KEY"]
+            globals()["BIRDEYE_API_KEY"] = SECRETS["BIRDEYE_API_KEY"]
+            globals()["HELIUS_RPC_URL"] = get_helius_rpc()
+            globals()["FREELLM_BASE"] = SECRETS["FREELLM_BASE"]
+            globals()["FREELLM_BASES"] = get_freellm_bases()
         if d.get("config"):
             state.config.update(d["config"])
     except Exception:
@@ -277,6 +332,14 @@ def save_state():
                 "positions": state.positions,
                 "trades": state.trades,
                 "config": state.config,
+                "secrets": {
+                    "HELIUS_KEY": SECRETS.get("HELIUS_KEY", ""),
+                    "FREELLM_API_KEY": SECRETS.get("FREELLM_API_KEY", ""),
+                    "FREELLM_BASE": SECRETS.get("FREELLM_BASE", ""),
+                    "BIRDEYE_API_KEY": SECRETS.get("BIRDEYE_API_KEY", ""),
+                    # private key only stored if user saved it via settings
+                    "SOLANA_PRIVATE_KEY": SECRETS.get("SOLANA_PRIVATE_KEY", ""),
+                },
             }, f)
     except Exception:
         pass
@@ -353,8 +416,8 @@ def discover_tokens_multi_source() -> List[Dict]:
         except Exception:
             pass
 
-    if BIRDEYE_API_KEY:
-        headers = {"X-API-KEY": BIRDEYE_API_KEY, "x-chain": "solana"}
+    if SECRETS.get("BIRDEYE_API_KEY"):
+        headers = {"X-API-KEY": SECRETS.get("BIRDEYE_API_KEY", ""), "x-chain": "solana"}
         for ep, params in [
             ("/defi/v2/tokens/new_listing", {"limit": 20, "meme_platform_enabled": "true"}),
             ("/defi/token_trending", {"sort_by": "rank", "sort_type": "asc", "offset": 0, "limit": 20}),
@@ -449,7 +512,7 @@ def discover_tokens_multi_source() -> List[Dict]:
 
 def rpc_call(method: str, params: list):
     try:
-        r = HTTP.post(HELIUS_RPC_URL, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=15)
+        r = HTTP.post(get_helius_rpc(), json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=15)
         if r.status_code == 200:
             return r.json().get("result")
     except Exception:
@@ -498,7 +561,7 @@ def jupiter_swap(quote, wallet) -> Optional[str]:
         signed = VersionedTransaction(unsigned.message, [wallet])
         encoded = base64.b64encode(bytes(signed)).decode()
         r2 = HTTP.post(
-            HELIUS_RPC_URL,
+            get_helius_rpc(),
             json={"jsonrpc": "2.0", "id": 1, "method": "sendTransaction", "params": [encoded, {"encoding": "base64", "skipPreflight": True}]},
             timeout=25,
         )
@@ -910,7 +973,7 @@ canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
 }
 #settings-overlay.open{display:flex}
 .settings-modal{
-  width:min(94%,560px);background:rgba(0,16,40,.97);
+  width:min(94%,580px);max-height:90vh;overflow-y:auto;background:rgba(0,16,40,.97);
   border:1px solid rgba(0,180,255,.65);
   box-shadow:0 0 50px rgba(0,150,255,.35);
   padding:32px 36px;border-radius:4px
@@ -980,11 +1043,29 @@ canvas{position:fixed;top:0;left:0;z-index:1;width:100%;height:100%}
         <input type="number" id="cfg-cap" step="0.05" min="0.05" max="5">
       </label>
     </div>
+    <div class="settings-title" style="margin-top:28px;font-size:16px">API KEYS & ENDPOINTS</div>
+    <div class="settings-grid" style="grid-template-columns:1fr">
+      <label>FreeLLM API Key
+        <input type="password" id="cfg-freellm-key" placeholder="freellmapi-..." autocomplete="off">
+      </label>
+      <label>FreeLLM Base URL
+        <input type="text" id="cfg-freellm-base" placeholder="http://127.0.0.1:3001/v1">
+      </label>
+      <label>Birdeye API Key
+        <input type="password" id="cfg-birdeye" placeholder="Birdeye X-API-KEY" autocomplete="off">
+      </label>
+      <label>Helius API Key
+        <input type="password" id="cfg-helius" placeholder="Helius RPC key" autocomplete="off">
+      </label>
+      <label>Solana Private Key (base58)
+        <input type="password" id="cfg-wallet" placeholder="Leave blank to keep current" autocomplete="off">
+      </label>
+    </div>
     <div class="settings-actions">
       <button class="btn" onclick="saveSettings()">SAVE</button>
       <button class="btn" onclick="closeSettings()">CLOSE</button>
     </div>
-    <div class="settings-hint">Changes apply to the live engine immediately. Saved in memory for this session.</div>
+    <div class="settings-hint">Keys are stored on the server (jarvis_state.json). Private key field stays blank when reopening — enter a new value only to change it. On Render, prefer env vars for production secrets.</div>
   </div>
 </div>
 <div class="panel" id="p-bal">
@@ -1458,10 +1539,19 @@ function openSettings() {
     document.getElementById('cfg-score').value = cfg.min_score ?? 58;
     document.getElementById('cfg-maxpos').value = cfg.max_positions ?? 5;
     document.getElementById('cfg-cap').value = cfg.max_trade_sol ?? 0.5;
+    // API keys (masked if set)
+    const sec = cfg.secrets || {};
+    document.getElementById('cfg-freellm-key').value = '';
+    document.getElementById('cfg-freellm-key').placeholder = sec.FREELLM_API_KEY_SET ? '•••• set — enter new to change' : 'freellmapi-...';
+    document.getElementById('cfg-freellm-base').value = sec.FREELLM_BASE || '';
+    document.getElementById('cfg-birdeye').value = '';
+    document.getElementById('cfg-birdeye').placeholder = sec.BIRDEYE_API_KEY_SET ? '•••• set — enter new to change' : 'Birdeye key';
+    document.getElementById('cfg-helius').value = '';
+    document.getElementById('cfg-helius').placeholder = sec.HELIUS_KEY_SET ? '•••• set — enter new to change' : 'Helius key';
+    document.getElementById('cfg-wallet').value = '';
+    document.getElementById('cfg-wallet').placeholder = sec.SOLANA_PRIVATE_KEY_SET ? '•••• set — enter new to change' : 'base58 private key';
     document.getElementById('settings-overlay').classList.add('open');
-  }).catch(() => {
-    document.getElementById('settings-overlay').classList.add('open');
-  });
+  }).catch(() => document.getElementById('settings-overlay').classList.add('open'));
 }
 function closeSettings() {
   document.getElementById('settings-overlay').classList.remove('open');
@@ -1476,22 +1566,29 @@ function saveSettings() {
     min_score: parseInt(document.getElementById('cfg-score').value, 10),
     max_positions: parseInt(document.getElementById('cfg-maxpos').value, 10),
     max_trade_sol: parseFloat(document.getElementById('cfg-cap').value),
+    secrets: {
+      FREELLM_API_KEY: document.getElementById('cfg-freellm-key').value.trim(),
+      FREELLM_BASE: document.getElementById('cfg-freellm-base').value.trim(),
+      BIRDEYE_API_KEY: document.getElementById('cfg-birdeye').value.trim(),
+      HELIUS_KEY: document.getElementById('cfg-helius').value.trim(),
+      SOLANA_PRIVATE_KEY: document.getElementById('cfg-wallet').value.trim(),
+    }
   };
+  // drop empty secret fields so we don't wipe existing
+  Object.keys(body.secrets).forEach(k => { if (!body.secrets[k]) delete body.secrets[k]; });
   fetch('/api/config', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
-  })
-  .then(r => r.json())
-  .then(() => {
-    const box = document.getElementById('messages');
-    box.innerHTML += '<div class="msg jarvis"><b>JARVIS:</b> Trade settings updated and armed.</div>';
-    box.scrollTop = box.scrollHeight;
+  }).then(r => r.json()).then(d => {
     closeSettings();
+    const box = document.getElementById('messages');
+    box.innerHTML += '<div class="msg jarvis"><b>JARVIS:</b> ' + (d.message || 'Settings saved, sir.') + '</div>';
+    box.scrollTop = box.scrollHeight;
     updateData();
-  })
-  .catch(() => alert('Failed to save settings'));
+  }).catch(() => alert('Save failed'));
 }
+
 
 function toggleEngine() {
   fetch('/api/toggle', { method: 'POST' }).then(() => updateData());
@@ -1617,15 +1714,29 @@ def api_config():
         data = request.json or {}
         for k in ("snipe_amount", "take_profit_pct", "trailing_stop_pct", "min_liquidity_usd",
                   "min_volume_24h", "max_positions", "min_score", "max_trade_sol"):
-            if k in data:
+            if k in data and data[k] is not None:
                 try:
                     state.config[k] = type(state.config.get(k, data[k]))(data[k])
                 except Exception:
                     pass
+        if isinstance(data.get("secrets"), dict):
+            apply_secrets(data["secrets"])
         save_state()
-        state.log("Settings updated via HUD")
-        return jsonify({"ok": True, "config": state.config})
-    return jsonify(state.config)
+        state.log("Settings updated")
+        return jsonify({"ok": True, "message": "Settings & keys updated, sir.", "config": state.config})
+    # GET — never return full secrets
+    return jsonify({
+        **state.config,
+        "secrets": {
+            "FREELLM_BASE": SECRETS.get("FREELLM_BASE", ""),
+            "FREELLM_API_KEY_SET": bool(SECRETS.get("FREELLM_API_KEY")),
+            "BIRDEYE_API_KEY_SET": bool(SECRETS.get("BIRDEYE_API_KEY")),
+            "HELIUS_KEY_SET": bool(SECRETS.get("HELIUS_KEY")),
+            "SOLANA_PRIVATE_KEY_SET": bool(SECRETS.get("SOLANA_PRIVATE_KEY")),
+        },
+    })
+
+
 
 ai_engine_global: Optional[MultiAIEngine] = None
 
